@@ -237,6 +237,52 @@ def test_wait_for_sister_login_destination_waits_for_final_redirect():
     page.wait_for_load_state.assert_awaited_once_with("domcontentloaded", timeout=30000)
 
 
+def test_direct_sister_login_continues_through_ade_portal(monkeypatch):
+    monkeypatch.setenv("SPID_PROVIDER", "sister")
+    monkeypatch.setenv("SISTER_USERNAME", "utente-test")
+    monkeypatch.setenv("SISTER_PASSWORD", "password-test")
+
+    page = MagicMock()
+    page.url = "https://portale.agenziaentrate.gov.it/PortaleWeb/home"
+    page.goto = AsyncMock()
+    page.wait_for_load_state = AsyncMock()
+    page.content = AsyncMock(return_value="<html></html>")
+
+    search = MagicMock()
+    search.click = AsyncMock()
+    search.fill = AsyncMock()
+    search.press = AsyncMock()
+    generic = MagicMock()
+    generic.click = AsyncMock()
+    generic.first = generic
+
+    def get_by_role(role, name=None, **_kwargs):
+        if role == "textbox" and name == "Cerca il servizio":
+            return search
+        return generic
+
+    page.get_by_role.side_effect = get_by_role
+    fake_logger = MagicMock()
+    fake_logger.log = AsyncMock()
+    monkeypatch.setattr(utils, "PageLogger", MagicMock(return_value=fake_logger))
+    direct_login = AsyncMock(return_value=None)
+    monkeypatch.setattr(utils, "_login_sister_direct", direct_login)
+    finish_visure = AsyncMock(return_value="FONDAZIONE FOCI")
+    monkeypatch.setattr(utils, "ensure_sister_visure_context", finish_visure)
+
+    selected = asyncio.run(utils.login(page))
+
+    assert selected == "FONDAZIONE FOCI"
+    direct_login.assert_awaited_once()
+    search.fill.assert_awaited_once_with("SISTER")
+    search.press.assert_awaited_once_with("Enter")
+    page.get_by_role.assert_any_call("link", name="Vai al servizio")
+    page.get_by_role.assert_any_call("button", name="Conferma")
+    page.get_by_role.assert_any_call("link", name="Consultazioni e Certificazioni")
+    page.get_by_role.assert_any_call("link", name="Visure catastali")
+    finish_visure.assert_awaited_once_with(page, fake_logger)
+
+
 def test_find_best_option_match_handles_aquila_with_apostrophe():
     """Caso F-NEW1: input ISTAT `L'Aquila`, option SISTER `L'AQUILA Territorio`."""
     page = _FakePageForMatch(
