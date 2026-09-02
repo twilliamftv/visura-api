@@ -600,6 +600,36 @@ async def login(page: Page):
         raise
 
 
+async def _wait_for_sister_login_destination(page: Page) -> None:
+    """Attende la fine della catena di redirect successiva al login diretto.
+
+    Il click su ``Accedi`` puo' caricare brevemente una pagina SISTER e poi
+    reindirizzare in modo asincrono a ``PortaleWeb/home``. Un semplice
+    ``wait_for_load_state`` puo' quindi riferirsi al documento precedente e
+    lasciare che la navigazione successiva interrompa l'apertura delle Visure.
+    """
+    try:
+        await page.wait_for_function(
+            """
+            () => {
+              const body = document.body ? document.body.innerText : '';
+              const atPortalHome = location.hostname === 'portale.agenziaentrate.gov.it'
+                && location.pathname.startsWith('/PortaleWeb/home');
+              const locked = location.pathname.includes('error_locked.jsp')
+                || body.includes("Utente gia' in sessione");
+              return atPortalHome || locked;
+            }
+            """,
+            timeout=30000,
+        )
+        await page.wait_for_load_state("domcontentloaded", timeout=30000)
+    except PlaywrightTimeoutError as exc:
+        page_path = page.url.split("?", 1)[0]
+        raise RuntimeError(
+            "Login SISTER non concluso: il redirect finale del portale non e' terminato; " f"pagina={page_path}"
+        ) from exc
+
+
 async def _login_sister_direct(page: Page, logger: PageLogger, username: str, password: str) -> Optional[str]:
     """Esegue il login diretto SISTER tramite il tab dedicato sulla pagina ADE.
 
@@ -641,7 +671,7 @@ async def _login_sister_direct(page: Page, logger: PageLogger, username: str, pa
 
         step = "attesa_sister"
         print("[LOGIN] Attendo caricamento portale SISTER...")
-        await page.wait_for_load_state("domcontentloaded", timeout=30000)
+        await _wait_for_sister_login_destination(page)
         await logger.log(page, "portale_sister")
 
         # Gestione sessioni orfane: ogni CloseSessionsSis chiude UNA sessione
@@ -683,7 +713,7 @@ async def _login_sister_direct(page: Page, logger: PageLogger, username: str, pa
             await page.get_by_role("textbox", name="Utente:").fill(username)
             await page.get_by_role("textbox", name="Password:").fill(password)
             await page.get_by_role("button", name="Accedi").click()
-            await page.wait_for_load_state("domcontentloaded", timeout=30000)
+            await _wait_for_sister_login_destination(page)
             await logger.log(page, f"portale_sister_retry_{attempts_done}")
 
             content = await page.content()

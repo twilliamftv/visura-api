@@ -223,6 +223,20 @@ def test_ensure_sister_context_opens_visure_from_portal_home(monkeypatch):
     logger.log.assert_awaited_once_with(page, "apertura_servizio_visure")
 
 
+def test_wait_for_sister_login_destination_waits_for_final_redirect():
+    page = MagicMock()
+    page.wait_for_function = AsyncMock()
+    page.wait_for_load_state = AsyncMock()
+
+    asyncio.run(utils._wait_for_sister_login_destination(page))
+
+    page.wait_for_function.assert_awaited_once()
+    script = page.wait_for_function.await_args.args[0]
+    assert "portale.agenziaentrate.gov.it" in script
+    assert "/PortaleWeb/home" in script
+    page.wait_for_load_state.assert_awaited_once_with("domcontentloaded", timeout=30000)
+
+
 def test_find_best_option_match_handles_aquila_with_apostrophe():
     """Caso F-NEW1: input ISTAT `L'Aquila`, option SISTER `L'AQUILA Territorio`."""
     page = _FakePageForMatch(
