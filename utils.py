@@ -531,24 +531,25 @@ async def login(page: Page):
         await logger.log(page, "goto_login")
 
         if spid_provider == "sister":
-            # Login diretto SISTER: bypass completo della navigazione ADE portal
-            # (cerca SISTER → Vai al servizio → Conferma → Consultazioni →
-            # Visure catastali → Conferma Lettura) perché l'area servizio si
-            # apre già dopo l'autenticazione SISTER nominale.
+            # Le credenziali nominali autenticano la home ADE, ma non
+            # trasferiscono automaticamente la sessione al sottosistema
+            # Visure. Dopo il login proseguiamo quindi nello stesso percorso
+            # del portale usato dagli altri provider: Cerca SISTER → Vai al
+            # servizio → Conferma → Consultazioni → Visure catastali.
             step = "provider_sister"
-            return await _login_sister_direct(page, logger, username, password)
+            await _login_sister_direct(page, logger, username, password)
+        else:
+            step = "entra_con_spid"
+            print("[LOGIN] Clicco 'Entra con SPID'...")
+            await page.get_by_role("button", name="Entra con SPID").click()
+            await logger.log(page, "entra_con_spid")
 
-        step = "entra_con_spid"
-        print("[LOGIN] Clicco 'Entra con SPID'...")
-        await page.get_by_role("button", name="Entra con SPID").click()
-        await logger.log(page, "entra_con_spid")
-
-        step = f"provider_{spid_provider}"
-        print(f"[LOGIN] Autenticazione tramite provider: {spid_provider}...")
-        if spid_provider == "sielte":
-            await _login_sielte(page, logger, username, password)
-        else:  # poste (gli altri valori sono già stati respinti sopra)
-            await _login_poste(page, logger, username, password)
+            step = f"provider_{spid_provider}"
+            print(f"[LOGIN] Autenticazione tramite provider: {spid_provider}...")
+            if spid_provider == "sielte":
+                await _login_sielte(page, logger, username, password)
+            else:  # poste (gli altri valori sono già stati respinti sopra)
+                await _login_poste(page, logger, username, password)
 
         step = "cerca_sister"
         print("[LOGIN] Cerco servizio SISTER...")
@@ -592,7 +593,7 @@ async def login(page: Page):
         await page.get_by_role("link", name="Conferma Lettura").click()
         await page.wait_for_load_state("domcontentloaded", timeout=30000)
         await logger.log(page, "conferma_lettura")
-        selected_convention = await _select_sister_convention_if_present(page, logger)
+        selected_convention = await ensure_sister_visure_context(page, logger)
         return selected_convention
 
     except Exception:
@@ -644,10 +645,9 @@ async def _login_sister_direct(page: Page, logger: PageLogger, username: str, pa
     richiede che l'utenza sia personale, non cedibile, e che le consultazioni
     siano riconducibili all'intestatario).
 
-    Dopo il login si atterra direttamente nella pagina SceltaServizio di
-    SISTER, saltando la navigazione tramite portale ADE (Cerca servizio →
-    Vai al servizio → Conferma → Consultazioni → Visure catastali → Conferma
-    Lettura) che non è necessaria con il login diretto.
+    Dopo il login si atterra nella home autenticata del portale ADE. Il
+    chiamante prosegue da li' attraverso il collegamento ufficiale al servizio
+    SISTER, necessario per trasferire la sessione al sottosistema Visure.
     """
     step = "sister_tab"
     try:
@@ -725,9 +725,8 @@ async def _login_sister_direct(page: Page, logger: PageLogger, username: str, pa
                 f"Utente già in sessione su un'altra postazione (max {MAX_CLOSE_ATTEMPTS} tentativi raggiunto)"
             )
 
-        selected_convention = await ensure_sister_visure_context(page, logger)
-        print("[LOGIN] Login SISTER completato.")
-        return selected_convention
+        print("[LOGIN] Autenticazione SISTER completata; apro il servizio dal portale ADE.")
+        return None
 
     except Exception:
         await logger.log(page, f"ERRORE_sister_{step}")
