@@ -14,10 +14,12 @@ from main import (
     VisuraRequest,
     VisuraResponse,
     VisuraService,
+    close_session_endpoint,
     extract_sezioni,
     get_visura_service,
     graceful_shutdown_endpoint,
     health_check,
+    open_session_endpoint,
     ottieni_visura,
     richiedi_intestati_immobile,
     richiedi_visura,
@@ -37,6 +39,18 @@ class FakeBrowserManager:
         self.authenticated = authenticated
         self.auth_page = object()
 
+    def status_snapshot(self):
+        return {
+            "session_state": "ready" if self.authenticated else "logged_out",
+            "authenticated": self.authenticated,
+            "convention": "FONDAZIONE FOCI",
+            "last_client_activity": None,
+            "last_sister_activity": None,
+            "idle_timeout_seconds": 900,
+            "keepalive_seconds": 60,
+            "error": None,
+        }
+
 
 class FakeService:
     def __init__(self):
@@ -45,6 +59,7 @@ class FakeService:
         self.added_requests = []
         self.added_intestati_requests = []
         self.responses = {}
+        self.active_request_id = None
 
     async def add_request(self, request):
         self.added_requests.append(request)
@@ -61,6 +76,14 @@ class FakeService:
 
     async def graceful_shutdown(self):
         return None
+
+    async def open_session(self):
+        self.browser_manager.authenticated = True
+        return self.browser_manager.status_snapshot()
+
+    async def close_session(self):
+        self.browser_manager.authenticated = False
+        return self.browser_manager.status_snapshot()
 
 
 def test_richiedi_visura_enqueues_both_catasto_types_when_missing_tipo_catasto():
@@ -146,7 +169,57 @@ def test_health_check_reflects_service_state():
     response = asyncio.run(health_check(service))
     payload = json.loads(response.body)
 
-    assert payload == {"status": "healthy", "authenticated": False, "queue_size": 4}
+    assert payload["status"] == "healthy"
+    assert payload["session_state"] == "logged_out"
+    assert payload["authenticated"] is False
+    assert payload["convention"] == "FONDAZIONE FOCI"
+    assert payload["queue_size"] == 4
+    assert payload["active_request_id"] is None
+
+
+def test_open_session_endpoint_opens_single_sister_session():
+    service = FakeService()
+    service.browser_manager.authenticated = False
+
+    response = asyncio.run(open_session_endpoint(service))
+    payload = json.loads(response.body)
+
+    assert payload["status"] == "ready"
+    assert payload["authenticated"] is True
+    assert payload["convention"] == "FONDAZIONE FOCI"
+
+
+def test_open_session_endpoint_returns_503_on_authentication_failure():
+    class BrokenService(FakeService):
+        async def open_session(self):
+            raise main.AuthenticationError("Utente gia' in sessione")
+
+    with pytest.raises(HTTPException) as exc:
+        asyncio.run(open_session_endpoint(BrokenService()))
+
+    assert exc.value.status_code == 503
+    assert "Utente gia'" not in exc.value.detail
+
+
+def test_close_session_endpoint_logs_out_when_queue_is_empty():
+    service = FakeService()
+
+    response = asyncio.run(close_session_endpoint(service))
+    payload = json.loads(response.body)
+
+    assert payload["status"] == "closed"
+    assert payload["authenticated"] is False
+
+
+def test_close_session_endpoint_returns_409_while_busy():
+    class BusyService(FakeService):
+        async def close_session(self):
+            raise RuntimeError("richieste in lavorazione")
+
+    with pytest.raises(HTTPException) as exc:
+        asyncio.run(close_session_endpoint(BusyService()))
+
+    assert exc.value.status_code == 409
 
 
 def test_visura_request_sets_timestamp_automatically():
@@ -381,6 +454,9 @@ def test_visura_response_sets_timestamp_automatically():
 
 def test_visura_service_add_request_and_get_response_with_real_queue(monkeypatch):
     class DummyBrowserManager:
+        async def open_session(self):
+            return {"session_state": "ready", "authenticated": True}
+
         async def close(self):
             return None
 
@@ -432,6 +508,122 @@ def test_visura_service_shutdown_and_graceful_shutdown_toggle_processing(monkeyp
     asyncio.run(service.graceful_shutdown())
     assert service.processing is False
     assert service.browser_manager.graceful is True
+
+
+def test_service_initialize_starts_monitor_without_opening_sister(monkeypatch):
+    class DummyBrowserManager:
+        def __init__(self):
+            self.monitor_started = 0
+            self.opened = 0
+
+        async def start_keep_alive(self):
+            self.monitor_started += 1
+
+        async def open_session(self):
+            self.opened += 1
+
+    monkeypatch.setattr(main, "BrowserManager", DummyBrowserManager)
+
+    async def scenario():
+        service = VisuraService()
+        await service.initialize()
+        assert service.browser_manager.monitor_started == 1
+        assert service.browser_manager.opened == 0
+        await service._stop_worker()
+
+    asyncio.run(scenario())
+
+
+def test_browser_manager_opens_only_one_concurrent_session():
+    class OpenPage:
+        def is_closed(self):
+            return False
+
+    class TestBrowserManager(main.BrowserManager):
+        def __init__(self):
+            super().__init__()
+            self.login_calls = 0
+
+        async def initialize(self):
+            self.browser = object()
+            self.context = object()
+
+        async def login(self):
+            self.login_calls += 1
+            await asyncio.sleep(0)
+            self.auth_page = OpenPage()
+            self.authenticated = True
+
+        async def start_keep_alive(self):
+            return None
+
+    async def scenario():
+        manager = TestBrowserManager()
+        first, second = await asyncio.gather(manager.open_session(), manager.open_session())
+        assert manager.login_calls == 1
+        assert first["session_state"] == "ready"
+        assert second["session_state"] == "ready"
+
+    asyncio.run(scenario())
+
+
+def test_keepalive_monitor_is_idempotent():
+    async def scenario():
+        manager = main.BrowserManager()
+        await manager.start_keep_alive()
+        first_task = manager.keep_alive_task
+        await manager.start_keep_alive()
+        assert manager.keep_alive_task is first_task
+        await manager.stop_keep_alive()
+        assert first_task.cancelled()
+
+    asyncio.run(scenario())
+
+
+def test_session_refresh_waits_for_page_lock():
+    class OpenPage:
+        def is_closed(self):
+            return False
+
+    async def scenario():
+        manager = main.BrowserManager()
+        manager.session_state = manager.STATE_READY
+        manager.authenticated = True
+        manager.auth_page = OpenPage()
+        manager.last_client_activity = main.datetime.now()
+        called = asyncio.Event()
+
+        async def fake_refresh():
+            called.set()
+            return True
+
+        manager._perform_session_refresh_unlocked = fake_refresh
+        await manager.page_lock.acquire()
+        task = asyncio.create_task(manager._perform_session_refresh())
+        await asyncio.sleep(0)
+        assert not called.is_set()
+        manager.page_lock.release()
+        assert await task is True
+        assert called.is_set()
+
+    asyncio.run(scenario())
+
+
+def test_idle_logout_is_cancelled_when_new_activity_arrives():
+    async def scenario():
+        manager = main.BrowserManager()
+        manager.session_state = manager.STATE_READY
+        manager.authenticated = True
+        manager.browser = object()
+        manager.last_client_activity = main.datetime.now()
+
+        snapshot = await manager.close_session(reason="idle_timeout")
+
+        assert snapshot["session_state"] == "ready"
+        assert snapshot["authenticated"] is True
+        assert manager.browser is not None
+
+    asyncio.run(scenario())
 
 
 # ---------------------------------------------------------------------------
@@ -579,6 +771,11 @@ def test_add_request_raises_queue_full_when_full(monkeypatch):
     """Coda piena → QueueFullError dal service layer."""
     monkeypatch.setenv("MAX_QUEUE_SIZE", "1")
     service = VisuraService()
+
+    async def fake_open_session():
+        return {"session_state": "ready", "authenticated": True}
+
+    service.open_session = fake_open_session
     req1 = VisuraRequest(
         request_id="r1",
         tipo_catasto="T",

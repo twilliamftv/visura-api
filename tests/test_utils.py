@@ -151,6 +151,45 @@ def test_normalize_strips_territorio_suffix():
     assert utils._normalize_for_match("Reggio nell'Emilia Territorio") == "reggio nell emilia"
 
 
+def test_choose_convention_candidate_selects_fondazione_foci_by_label():
+    candidates = [
+        {
+            "index": 0,
+            "value": "1479967",
+            "text": "FONDAZIONE FOCI ASSOCIAZIONE DI PROMOZIONE SOCIALE (CONSULTAZIONI - PROFILO B)",
+        },
+        {
+            "index": 1,
+            "value": "1413372",
+            "text": "GETCHAR SRL (CONSULTAZIONI - PROFILO B)",
+        },
+    ]
+
+    chosen = utils._choose_convention_candidate(candidates, "Fondazione Foci")
+
+    assert chosen["value"] == "1479967"
+
+
+def test_choose_convention_candidate_requires_target_with_multiple_options():
+    candidates = [
+        {"index": 0, "value": "1", "text": "FONDAZIONE FOCI"},
+        {"index": 1, "value": "2", "text": "GETCHAR SRL"},
+    ]
+
+    with pytest.raises(RuntimeError, match="SISTER_CONVENTION"):
+        utils._choose_convention_candidate(candidates, "")
+
+
+def test_choose_convention_candidate_rejects_missing_target():
+    candidates = [
+        {"index": 0, "value": "1", "text": "FONDAZIONE FOCI"},
+        {"index": 1, "value": "2", "text": "GETCHAR SRL"},
+    ]
+
+    with pytest.raises(RuntimeError, match="non trovata"):
+        utils._choose_convention_candidate(candidates, "ALTRA CONVENZIONE")
+
+
 def test_find_best_option_match_handles_aquila_with_apostrophe():
     """Caso F-NEW1: input ISTAT `L'Aquila`, option SISTER `L'AQUILA Territorio`."""
     page = _FakePageForMatch(

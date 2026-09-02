@@ -341,6 +341,120 @@ async def _login_poste(page: Page, logger: PageLogger, username: str, password: 
         raise
 
 
+def _choose_convention_candidate(candidates: list[dict], target: str) -> dict:
+    """Restituisce una sola convenzione corrispondente al nome configurato.
+
+    SISTER salta del tutto la pagina di scelta quando l'utenza ha una sola
+    convenzione. Quando invece la pagina e' presente non e' sicuro scegliere
+    la prima voce: una stessa utenza puo' operare per soggetti diversi.
+    """
+    usable = [candidate for candidate in candidates if candidate.get("text")]
+    if not usable:
+        raise RuntimeError("Pagina di scelta convenzione priva di opzioni utilizzabili")
+
+    normalized_target = _normalize_for_match(target)
+    if not normalized_target:
+        if len(usable) == 1:
+            return usable[0]
+        raise RuntimeError(
+            "Sono disponibili piu' convenzioni SISTER: configurare SISTER_CONVENTION "
+            "con il nome esatto del soggetto da utilizzare"
+        )
+
+    matches = []
+    for candidate in usable:
+        normalized_text = _normalize_for_match(candidate["text"])
+        if normalized_text == normalized_target or normalized_target in normalized_text:
+            matches.append(candidate)
+
+    if not matches:
+        available = ", ".join(candidate["text"] for candidate in usable)
+        raise RuntimeError(f"Convenzione SISTER '{target}' non trovata. Convenzioni disponibili: {available}")
+    if len(matches) > 1:
+        matching = ", ".join(candidate["text"] for candidate in matches)
+        raise RuntimeError(f"Convenzione SISTER '{target}' ambigua. Corrispondenze: {matching}")
+    return matches[0]
+
+
+async def _select_sister_convention_if_present(page: Page, logger: PageLogger) -> Optional[str]:
+    """Se SISTER mostra l'elenco convenzioni, seleziona quella configurata.
+
+    Il portale espone il form ``SelConv`` con radio ``idConv`` e invia la
+    scelta a ``/Visure/SelezioneConvenzione.do``. I selettori sono volutamente
+    limitati a quel form: le altre radio e dropdown della pagina non devono
+    mai essere interpretate come convenzioni.
+    """
+    form = page.locator('form[name="SelConv"]')
+    if await form.count() == 0:
+        return None
+    if await form.count() != 1:
+        raise RuntimeError("Pagina SISTER con piu' form SelConv: selezione convenzione non sicura")
+
+    candidates = await form.evaluate("""
+        form => {
+          const clean = value => (value || '').replace(/\\s+/g, ' ').trim();
+          const rows = [];
+
+          form.querySelectorAll('input[type="radio"][name="idConv"]').forEach((input, index) => {
+            const label = input.id ? form.querySelector(`label[for="${CSS.escape(input.id)}"]`) : null;
+            const container = input.closest('tr, li, fieldset, div, p');
+            const text = clean((label && label.textContent) || (container && container.textContent) || input.value);
+            if (text) rows.push({index, value: input.value || '', text});
+          });
+          return rows;
+        }
+        """)
+
+    target = os.getenv("SISTER_CONVENTION", "").strip()
+    chosen = _choose_convention_candidate(candidates, target)
+
+    radios = form.locator('input[type="radio"][name="idConv"]')
+    await radios.nth(chosen["index"]).check()
+
+    advance = form.locator(
+        'input[type="submit"][name="submit"][value="Avanti"], ' 'button[type="submit"]:has-text("Avanti")'
+    )
+    if await advance.count() != 1:
+        raise RuntimeError("Form SelConv riconosciuto, ma il pulsante Avanti non e' univoco")
+
+    print(f"[LOGIN] Seleziono convenzione SISTER: {chosen['text']}")
+    await advance.click()
+    await page.wait_for_load_state("domcontentloaded", timeout=30000)
+    await logger.log(page, "convenzione_selezionata")
+
+    if await page.locator('form[name="SelConv"]').count() != 0:
+        raise RuntimeError("SISTER e' rimasto sulla pagina di scelta convenzione dopo Avanti")
+
+    return chosen["text"]
+
+
+async def ensure_sister_visure_context(page: Page, logger: PageLogger) -> Optional[str]:
+    """Completa Informativa e scelta convenzione fino alla lista degli uffici.
+
+    Con piu' convenzioni il flusso reale e': ``Informativa.do`` → Conferma
+    Lettura → ``SceltaServizio.do`` (radio ``idConv``) → Avanti →
+    ``SelezioneConvenzione.do`` (ufficio provinciale ``listacom``).
+    """
+    if "Informativa.do" in page.url:
+        confirm = page.get_by_role("link", name=re.compile(r"Conferma\s+Lettura", re.I))
+        if await confirm.count() != 1:
+            raise RuntimeError("Pagina informativa SISTER priva del link Conferma Lettura univoco")
+        print("[LOGIN] Confermo la lettura dell'informativa SISTER...")
+        await confirm.click()
+        await page.wait_for_load_state("domcontentloaded", timeout=30000)
+        await logger.log(page, "conferma_lettura")
+
+    selected = await _select_sister_convention_if_present(page, logger)
+    try:
+        await page.locator("select[name='listacom']").wait_for(state="attached", timeout=15000)
+    except PlaywrightTimeoutError as exc:
+        raise RuntimeError(
+            "Flusso SISTER incompleto: dopo informativa/convenzione non e' apparsa "
+            "la scelta dell'ufficio provinciale (listacom)"
+        ) from exc
+    return selected
+
+
 async def login(page: Page):
     """Esegue il login completo (SPID + navigazione fino a 'Visure catastali').
 
@@ -399,8 +513,7 @@ async def login(page: Page):
             # Visure catastali → Conferma Lettura) perché l'area servizio si
             # apre già dopo l'autenticazione SISTER nominale.
             step = "provider_sister"
-            await _login_sister_direct(page, logger, username, password)
-            return
+            return await _login_sister_direct(page, logger, username, password)
 
         step = "entra_con_spid"
         print("[LOGIN] Clicco 'Entra con SPID'...")
@@ -454,14 +567,17 @@ async def login(page: Page):
         step = "conferma_lettura"
         print("[LOGIN] Clicco 'Conferma Lettura'...")
         await page.get_by_role("link", name="Conferma Lettura").click()
+        await page.wait_for_load_state("domcontentloaded", timeout=30000)
         await logger.log(page, "conferma_lettura")
+        selected_convention = await _select_sister_convention_if_present(page, logger)
+        return selected_convention
 
     except Exception:
         await logger.log(page, f"ERRORE_{step}")
         raise
 
 
-async def _login_sister_direct(page: Page, logger: PageLogger, username: str, password: str) -> None:
+async def _login_sister_direct(page: Page, logger: PageLogger, username: str, password: str) -> Optional[str]:
     """Esegue il login diretto SISTER tramite il tab dedicato sulla pagina ADE.
 
     Credenziali richieste:
@@ -556,7 +672,9 @@ async def _login_sister_direct(page: Page, logger: PageLogger, username: str, pa
                 f"Utente già in sessione su un'altra postazione (max {MAX_CLOSE_ATTEMPTS} tentativi raggiunto)"
             )
 
+        selected_convention = await ensure_sister_visure_context(page, logger)
         print("[LOGIN] Login SISTER completato.")
+        return selected_convention
 
     except Exception:
         await logger.log(page, f"ERRORE_sister_{step}")
@@ -1031,13 +1149,15 @@ async def run_visura(
     # STEP 1: Selezione Ufficio Provinciale
     print("[VISURA] Navigando alla pagina di scelta servizio...")
     await page.goto("https://sister3.agenziaentrate.gov.it/Visure/SceltaServizio.do?tipo=/T/TM/VCVC_", timeout=60000)
+    await page.wait_for_load_state("domcontentloaded", timeout=30000)
+    await ensure_sister_visure_context(page, logger)
     await _wait_for_ready(page, "select[name='listacom']", label="visura_scelta_servizio")
     print("[VISURA] Pagina caricata")
     await logger.log(page, "scelta_servizio")
 
     # Verifica che siamo realmente nella pagina di scelta servizio
     current_url = page.url
-    if "SceltaServizio.do" not in current_url:
+    if "SceltaServizio.do" not in current_url and "SelezioneConvenzione.do" not in current_url:
         raise Exception(
             f"La sessione sembra essere scaduta o si è verificato un errore durante il caricamento della pagina - URL: {current_url}"
         )
@@ -1499,6 +1619,7 @@ async def extract_all_sezioni(page: Page, tipo_catasto: str = "T", max_province:
             "https://sister3.agenziaentrate.gov.it/Visure/SceltaServizio.do?tipo=/T/TM/VCVC_", timeout=60000
         )
         await page.wait_for_load_state("domcontentloaded", timeout=30000)
+        await ensure_sister_visure_context(page, logger)
         print("[SEZIONI] Pagina caricata")
         await logger.log(page, "scelta_servizio")
 
@@ -1654,6 +1775,7 @@ async def extract_all_sezioni(page: Page, tipo_catasto: str = "T", max_province:
                     "https://sister3.agenziaentrate.gov.it/Visure/SceltaServizio.do?tipo=/T/TM/VCVC_", timeout=60000
                 )
                 await page.wait_for_load_state("domcontentloaded", timeout=30000)
+                await ensure_sister_visure_context(page, logger)
                 print("[SEZIONI] Tornato alla pagina principale")
 
             except Exception as e:
@@ -1713,13 +1835,15 @@ async def run_visura_immobile(
     # STEP 1: Selezione Ufficio Provinciale
     print("[VISURA_IMMOBILE] Navigando alla pagina di scelta servizio...")
     await page.goto("https://sister3.agenziaentrate.gov.it/Visure/SceltaServizio.do?tipo=/T/TM/VCVC_", timeout=60000)
+    await page.wait_for_load_state("domcontentloaded", timeout=30000)
+    await ensure_sister_visure_context(page, logger)
     await _wait_for_ready(page, "select[name='listacom']", label="immobile_scelta_servizio")
     print("[VISURA_IMMOBILE] Pagina caricata")
     await logger.log(page, "scelta_servizio")
 
     # Verifica che siamo realmente nella pagina di scelta servizio
     current_url = page.url
-    if "SceltaServizio.do" not in current_url:
+    if "SceltaServizio.do" not in current_url and "SelezioneConvenzione.do" not in current_url:
         raise Exception(f"La sessione sembra essere scaduta o si è verificato un errore - URL: {current_url}")
 
     # Trova e seleziona la provincia corretta

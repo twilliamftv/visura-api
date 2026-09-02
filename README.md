@@ -26,6 +26,7 @@ Servizio REST per l'estrazione automatizzata di dati catastali dal portale **SIS
 - [Configurazione](#configurazione)
 - [Endpoint API](#endpoint-api)
   - [Health check](#health-check)
+  - [Sessione SISTER](#sessione-sister)
   - [Visura immobili (Fase 1)](#visura-immobili-fase-1)
   - [Visura intestati (Fase 2)](#visura-intestati-fase-2)
   - [Polling risultati](#polling-risultati)
@@ -57,8 +58,10 @@ Entrambe le richieste vengono accodate ed eseguite sequenzialmente su un singolo
 
 - **Autenticazione SPID/SISTER automatizzata** — provider Sielte ID, PosteID o login diretto SISTER (selezionabile via `SPID_PROVIDER`)
 - **Coda sequenziale** — le richieste vengono processate una alla volta per non sovraccaricare il portale
-- **Ri-autenticazione automatica** — alla scadenza della sessione, il servizio tenta prima un recovery diretto e, solo se necessario, un nuovo login SPID
-- **Keep-alive** — la sessione viene mantenuta attiva con un light keep-alive ogni 30 secondi e un refresh profondo ogni 5 minuti
+- **Sessione unica e lazy** — il browser SISTER viene aperto alla prima richiesta o tramite `POST /session/open`, mai in parallelo
+- **Convenzioni multiple** — selezione esplicita tramite `SISTER_CONVENTION`, senza scegliere automaticamente la prima convenzione
+- **Keep-alive serializzato** — il rinnovo usa lo stesso lock delle visure e non può navigare mentre una richiesta è in corso
+- **Logout per inattività** — la sessione viene chiusa dopo un intervallo configurabile senza richieste del client
 - **Graceful shutdown** — su `SIGINT`/`SIGTERM` il servizio effettua il logout dal portale prima di chiudere il browser
 - **Logging HTML completo** — ogni pagina visitata dal browser viene salvata su disco per debug e audit
 - **Docker-ready** — immagine pronta con tutte le dipendenze di sistema per Chromium headless
@@ -197,8 +200,14 @@ Crea un file `.env` nella root del progetto (vedi `.env.example`):
 
 ```env
 # Obbligatorio — Credenziali SPID (Sielte ID)
-ADE_USERNAME=RSSMRA85M01H501Z    # Codice fiscale
+ADE_USERNAME=CODICE_FISCALE_UTENTE    # Codice fiscale
 ADE_PASSWORD=la_tua_password
+
+# Oppure: login diretto SISTER
+SPID_PROVIDER=sister
+SISTER_USERNAME=utente_sister
+SISTER_PASSWORD=password_sister
+SISTER_CONVENTION=FONDAZIONE FOCI
 
 # Opzionale
 LOG_LEVEL=INFO                    # DEBUG | INFO | WARNING | ERROR
@@ -208,6 +217,12 @@ LOG_LEVEL=INFO                    # DEBUG | INFO | WARNING | ERROR
 |-----------|:------------:|---------|-------------|
 | `ADE_USERNAME` | ✅ | — | Codice fiscale per il login SPID |
 | `ADE_PASSWORD` | ✅ | — | Password SPID (Sielte ID) |
+| `SPID_PROVIDER` | | `sielte` | Provider: `sielte`, `poste` o `sister` |
+| `SISTER_USERNAME` | Per `sister` | — | Utente nominale SISTER |
+| `SISTER_PASSWORD` | Per `sister` | — | Password SISTER |
+| `SISTER_CONVENTION` | Con più convenzioni | — | Parte univoca dell'etichetta della convenzione, es. `FONDAZIONE FOCI` |
+| `SESSION_KEEPALIVE_SECONDS` | | `60` | Rinnovo dall'ultima navigazione SISTER completata |
+| `SESSION_IDLE_TIMEOUT_SECONDS` | | `900` | Logout dopo inattività del client |
 | `LOG_LEVEL` | | `INFO` | Livello di log su console e file |
 
 ---
@@ -223,10 +238,35 @@ GET /health
 ```json
 {
   "status": "healthy",
+  "session_state": "ready",
   "authenticated": true,
-  "queue_size": 0
+  "convention": "FONDAZIONE FOCI ASSOCIAZIONE DI PROMOZIONE SOCIALE (CONSULTAZIONI - PROFILO B)",
+  "queue_size": 0,
+  "active_request_id": null
 }
 ```
+
+`status: healthy` indica che il processo API risponde. Lo stato operativo di
+SISTER è in `session_state`: `logged_out`, `opening`, `ready`, `busy`,
+`locked`, `error` oppure `closing`.
+
+---
+
+### Sessione SISTER
+
+```text
+POST /session/open
+POST /session/close
+```
+
+Entrambi richiedono `X-API-Key`. `open` è idempotente: se la sessione unica è
+già pronta registra l'attività del client e la riusa. `close` esegue il logout
+solo a coda vuota; con una visura attiva o accodata risponde `409`.
+
+Con più convenzioni SISTER, dopo `Conferma Lettura` il servizio seleziona la
+radio `idConv` nel form `SelConv` la cui etichetta corrisponde a
+`SISTER_CONVENTION`, invia `Avanti` e verifica la comparsa della scelta
+dell'ufficio provinciale.
 
 ---
 
@@ -392,8 +432,8 @@ Recupera lo stato e i dati di una richiesta precedentemente accodata.
     },
     "intestati": [
       {
-        "Nominativo o denominazione": "ROSSI MARIO",
-        "Codice fiscale": "RSSMRA85M01H501Z",
+        "Nominativo o denominazione": "NOMINATIVO DI ESEMPIO",
+        "Codice fiscale": "CODICE_FISCALE_DI_ESEMPIO",
         "Titolarità": "Proprietà per 1/1"
       }
     ],
@@ -608,14 +648,18 @@ Il progetto non applica ancora un mascheramento automatico dei dati nei log HTML
 
 | Meccanismo | Intervallo | Descrizione |
 |------------|------------|-------------|
-| **Light keep-alive** | 30 secondi | Mouse move sulla pagina per evitare timeout idle |
-| **Session refresh** | 5 minuti | Naviga a `SceltaServizio.do` e verifica che la sessione sia ancora attiva |
-| **Recovery** | Su errore | Navigazione diretta → percorso interno → re-login SPID completo |
+| **Monitor** | 30 secondi | Controlla se servono rinnovo o logout, senza aprire sessioni |
+| **Session refresh** | 60 secondi | Naviga a `SceltaServizio.do`, riseleziona la convenzione se richiesta e verifica gli uffici |
+| **Logout inattività** | 15 minuti | Chiude browser e sessione se non arrivano richieste client |
+
+Tutte le navigazioni Playwright — visura, intestati, rinnovo e logout — usano
+un unico lock. Il monitor non può quindi interrompere una pagina mentre la
+coda sta elaborando una richiesta.
 
 ### Coda di elaborazione
 
 - Unica `asyncio.Queue` con worker sequenziale
-- Pausa di **2 secondi** tra una richiesta e l'altra
+- Pausa di **0,1 secondi** tra una richiesta e l'altra
 - Pausa di **5 secondi** dopo un errore
 - I risultati restano in memoria (`response_store`) fino al riavvio del servizio
 - Il client fa polling su `GET /visura/{request_id}` — restituisce `"processing"` finché il risultato non è pronto
@@ -626,7 +670,7 @@ Quando uvicorn riceve `SIGINT` o `SIGTERM`:
 
 1. Il lifespan `shutdown` viene invocato da uvicorn
 2. `logout()` clicca "Esci" sul portale SISTER
-3. `close()` clicca "Torna al portale", chiude il browser context, chiude Chromium
+3. Il browser context e Chromium vengono chiusi anche se il logout remoto va in timeout
 
 Il browser viene lanciato con `handle_sigint=False, handle_sigterm=False` per impedire che Chromium intercetti i segnali prima che il logout sia completato.
 
@@ -640,6 +684,7 @@ Il browser viene lanciato con `handle_sigint=False, handle_sigterm=False` per im
 6. Cerca "SISTER" tra i servizi → clicca "Vai al servizio"
 7. Verifica assenza di sessione bloccata ("Utente già in sessione")
 8. Naviga: Conferma → Consultazioni e Certificazioni → Visure catastali → Conferma Lettura
+9. Se sono presenti più convenzioni, sceglie quella configurata e prosegue alla selezione dell'ufficio
 
 ### Flusso della visura
 
