@@ -435,6 +435,21 @@ async def ensure_sister_visure_context(page: Page, logger: PageLogger) -> Option
     Lettura → ``SceltaServizio.do`` (radio ``idConv``) → Avanti →
     ``SelezioneConvenzione.do`` (ufficio provinciale ``listacom``).
     """
+    service_url = "https://sister3.agenziaentrate.gov.it/Visure/SceltaServizio.do?tipo=/T/TM/VCVC_"
+
+    # Il login diretto SISTER puo' atterrare sulla home generale del portale,
+    # non direttamente dentro il flusso Visure. In quel caso apriamo
+    # esplicitamente il servizio prima di cercare informativa, convenzione e
+    # lista degli uffici. Senza questo passaggio il login e' valido, ma la
+    # ricerca di ``listacom`` avviene nella pagina sbagliata.
+    has_offices = await page.locator("select[name='listacom']").count() != 0
+    has_conventions = await page.locator('form[name="SelConv"]').count() != 0
+    if "Informativa.do" not in page.url and not has_offices and not has_conventions:
+        print("[LOGIN] Apro il servizio Visure catastali...")
+        await page.goto(service_url, timeout=30000)
+        await page.wait_for_load_state("domcontentloaded", timeout=30000)
+        await logger.log(page, "apertura_servizio_visure")
+
     if "Informativa.do" in page.url:
         confirm = page.get_by_role("link", name=re.compile(r"Conferma\s+Lettura", re.I))
         if await confirm.count() != 1:
@@ -448,9 +463,17 @@ async def ensure_sister_visure_context(page: Page, logger: PageLogger) -> Option
     try:
         await page.locator("select[name='listacom']").wait_for(state="attached", timeout=15000)
     except PlaywrightTimeoutError as exc:
+        page_path = page.url.split("?", 1)[0]
+        markers = await page.evaluate("""
+            () => ({
+              forms: Array.from(document.forms, form => form.name || form.action || '(senza nome)'),
+              selects: Array.from(document.querySelectorAll('select'), select => select.name || select.id || '(senza nome)')
+            })
+            """)
         raise RuntimeError(
             "Flusso SISTER incompleto: dopo informativa/convenzione non e' apparsa "
-            "la scelta dell'ufficio provinciale (listacom)"
+            "la scelta dell'ufficio provinciale (listacom); "
+            f"pagina={page_path}, form={markers['forms']}, select={markers['selects']}"
         ) from exc
     return selected
 
