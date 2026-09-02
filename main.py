@@ -19,7 +19,7 @@ import logging
 import os
 import secrets
 import time
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, suppress
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Dict, Optional
@@ -33,7 +33,15 @@ from playwright.async_api import Browser, BrowserContext, Page, async_playwright
 from playwright.async_api import TimeoutError as PlaywrightTimeoutError
 from pydantic import BaseModel, Field, field_validator
 
-from utils import PageLogger, extract_all_sezioni, login, logout, run_visura, run_visura_immobile
+from utils import (
+    PageLogger,
+    ensure_sister_visure_context,
+    extract_all_sezioni,
+    login,
+    logout,
+    run_visura,
+    run_visura_immobile,
+)
 
 # Carica variabili d'ambiente da .env
 load_dotenv()
@@ -145,6 +153,14 @@ class VisuraResponse:
 
 
 class BrowserManager:
+    STATE_LOGGED_OUT = "logged_out"
+    STATE_OPENING = "opening"
+    STATE_READY = "ready"
+    STATE_BUSY = "busy"
+    STATE_LOCKED = "locked"
+    STATE_ERROR = "error"
+    STATE_CLOSING = "closing"
+
     def __init__(self):
         self.playwright = None
         self.browser: Optional[Browser] = None
@@ -152,7 +168,15 @@ class BrowserManager:
         self.auth_page: Optional[Page] = None
         self.authenticated = False
         self.keep_alive_running = False
+        self.keep_alive_task: Optional[asyncio.Task] = None
         self.last_login_time = None
+        self.last_client_activity = None
+        self.last_sister_activity = None
+        self.selected_convention: Optional[str] = None
+        self.session_state = self.STATE_LOGGED_OUT
+        self.session_error: Optional[str] = None
+        self.page_lock = asyncio.Lock()
+        self.session_lock = asyncio.Lock()
         # Stats per resource blocking (popolato in initialize → context.route)
         self.blocked_resources_count: int = 0
         self.blocked_resources_samples: list = []  # primi N URL bloccati per diagnostica
@@ -215,6 +239,9 @@ class BrowserManager:
     async def initialize(self):
         """Inizializza il browser e il contexto"""
         try:
+            if self.browser is not None and self.browser.is_connected() and self.context is not None:
+                return
+
             # Ferma un'eventuale istanza Playwright precedente per evitare
             # processi Chromium orfani al re-init (session recovery, restart).
             if self.playwright is not None:
@@ -289,17 +316,23 @@ class BrowserManager:
                         logger.warning(f"Errore chiudendo vecchia pagina: {e}")
 
                 page = await self.context.new_page()
-                logger.info(f"Tentativo login {attempt}/{max_attempts}")
-                await login(page)
                 self.auth_page = page
+                logger.info(f"Tentativo login {attempt}/{max_attempts}")
+                selected_convention = await login(page)
                 self.authenticated = True
                 self.last_login_time = datetime.now()
+                self.last_client_activity = self.last_login_time
+                self.last_sister_activity = self.last_login_time
+                self.selected_convention = selected_convention or os.getenv("SISTER_CONVENTION") or None
                 logger.info(f"Login completato con successo al tentativo {attempt}")
                 return
             except PlaywrightTimeoutError as e:
                 # Push SPID non approvata in tempo — utente probabilmente
                 # distratto o push arrivata in ritardo. Ritentiamo.
                 last_exc = e
+                if os.getenv("SPID_PROVIDER", "sielte").lower() == "sister":
+                    self.authenticated = False
+                    raise AuthenticationError(f"Login SISTER scaduto o incompleto: {e}") from e
                 logger.warning(
                     f"Tentativo login {attempt}/{max_attempts} fallito per timeout "
                     f"(probabile push SPID non approvata): {e}"
@@ -324,32 +357,94 @@ class BrowserManager:
             f"Login failed after {max_attempts} attempts (push SPID not approved " f"in time): {last_exc}"
         ) from last_exc
 
+    def mark_client_activity(self) -> None:
+        """Registra un accesso reale del client; il keep-alive non chiama questo metodo."""
+        self.last_client_activity = datetime.now()
+
+    def status_snapshot(self) -> dict:
+        return {
+            "session_state": self.session_state,
+            "authenticated": self.authenticated,
+            "convention": self.selected_convention,
+            "last_client_activity": (self.last_client_activity.isoformat() if self.last_client_activity else None),
+            "last_sister_activity": (self.last_sister_activity.isoformat() if self.last_sister_activity else None),
+            "idle_timeout_seconds": int(os.getenv("SESSION_IDLE_TIMEOUT_SECONDS", "900")),
+            "keepalive_seconds": int(os.getenv("SESSION_KEEPALIVE_SECONDS", "60")),
+            "error": self.session_error,
+        }
+
+    async def open_session(self) -> dict:
+        """Apre una sola sessione SISTER, su richiesta e con accesso serializzato."""
+        self.mark_client_activity()
+        async with self.session_lock:
+            if (
+                self.session_state in {self.STATE_READY, self.STATE_BUSY}
+                and self.authenticated
+                and self.auth_page
+                and not self.auth_page.is_closed()
+            ):
+                return self.status_snapshot()
+
+            self.session_state = self.STATE_OPENING
+            self.session_error = None
+            try:
+                async with self.page_lock:
+                    if self.browser is not None or self.context is not None or self.playwright is not None:
+                        await self._logout_and_close_browser_unlocked(reason="reopen")
+                    await self.initialize()
+                    await self.login()
+                self.session_state = self.STATE_READY
+                await self.start_keep_alive()
+                return self.status_snapshot()
+            except Exception as e:
+                self.authenticated = False
+                self.session_error = str(e)
+                self.session_state = (
+                    self.STATE_LOCKED
+                    if "gia' in sessione" in str(e).lower() or "già in sessione" in str(e).lower()
+                    else self.STATE_ERROR
+                )
+                async with self.page_lock:
+                    await self._logout_and_close_browser_unlocked(reason="open_failed")
+                raise AuthenticationError(str(e)) from e
+
     async def start_keep_alive(self):
-        """Mantiene la sessione attiva con attività realistiche"""
+        """Avvia un solo monitor per rinnovo e logout automatico."""
+        if self.keep_alive_task and not self.keep_alive_task.done():
+            return
         self.keep_alive_running = True
 
         async def keep_alive_worker():
-            last_check = datetime.now()
             while self.keep_alive_running:
                 try:
-                    if self.auth_page and not self.auth_page.is_closed():
-                        current_time = datetime.now()
+                    interval = max(5, int(os.getenv("SESSION_MONITOR_INTERVAL_SECONDS", "30")))
+                    await asyncio.sleep(interval)
+                    if self.session_state not in {self.STATE_READY, self.STATE_BUSY}:
+                        continue
 
-                        # Ogni 5 minuti, fai una verifica più approfondita
-                        if (current_time - last_check).total_seconds() > 300:
-                            await self._perform_session_refresh()
-                            last_check = current_time
-                        else:
-                            # Keep-alive leggero ogni 30 secondi
-                            await self._perform_light_keepalive()
+                    now = datetime.now()
+                    idle_timeout = max(60, int(os.getenv("SESSION_IDLE_TIMEOUT_SECONDS", "900")))
+                    keepalive_after = max(60, int(os.getenv("SESSION_KEEPALIVE_SECONDS", "60")))
+                    idle_for = (
+                        (now - self.last_client_activity).total_seconds() if self.last_client_activity else idle_timeout
+                    )
+                    if idle_for >= idle_timeout:
+                        logger.info(f"Sessione inattiva da {idle_for:.0f}s: eseguo logout")
+                        await self.close_session(reason="idle_timeout")
+                        continue
 
-                    await asyncio.sleep(30)
-
+                    sister_idle_for = (
+                        (now - self.last_sister_activity).total_seconds()
+                        if self.last_sister_activity
+                        else keepalive_after
+                    )
+                    if sister_idle_for >= keepalive_after:
+                        await self._perform_session_refresh()
                 except Exception as e:
                     logger.error(f"Errore in keep-alive: {e}")
-                    await asyncio.sleep(60)
+                    await asyncio.sleep(5)
 
-        asyncio.create_task(keep_alive_worker())
+        self.keep_alive_task = asyncio.create_task(keep_alive_worker(), name="sister-session-monitor")
 
     async def _perform_light_keepalive(self):
         """Keep-alive leggero: movimento del mouse"""
@@ -363,6 +458,25 @@ class BrowserManager:
 
     async def _perform_session_refresh(self):
         """Refresh approfondito della sessione navigando alla pagina di scelta servizio"""
+        async with self.page_lock:
+            if (
+                self.session_state != self.STATE_READY
+                or not self.authenticated
+                or not self.auth_page
+                or self.auth_page.is_closed()
+            ):
+                return False
+
+            idle_timeout = max(60, int(os.getenv("SESSION_IDLE_TIMEOUT_SECONDS", "900")))
+            if (
+                self.last_client_activity
+                and (datetime.now() - self.last_client_activity).total_seconds() >= idle_timeout
+            ):
+                return False
+
+            return await self._perform_session_refresh_unlocked()
+
+    async def _perform_session_refresh_unlocked(self):
         try:
             logger.info("Eseguendo refresh della sessione...")
 
@@ -370,29 +484,43 @@ class BrowserManager:
                 "https://sister3.agenziaentrate.gov.it/Visure/SceltaServizio.do?tipo=/T/TM/VCVC_", timeout=30000
             )
             await self.auth_page.wait_for_load_state("domcontentloaded", timeout=15000)
+            await ensure_sister_visure_context(self.auth_page, PageLogger("session_refresh"))
 
             try:
                 provincia_options = await self.auth_page.locator("select[name='listacom'] option").count()
                 if provincia_options <= 1:
                     logger.warning("Sessione scaduta durante refresh - province non disponibili")
                     self.authenticated = False
+                    self.session_state = self.STATE_ERROR
+                    self.session_error = "Province non disponibili dopo il rinnovo della sessione"
                     return False
                 else:
+                    self.last_sister_activity = datetime.now()
                     logger.info(f"Session refresh completato - {provincia_options-1} province disponibili")
                     return True
             except Exception as e:
                 logger.warning(f"Errore nel verificare province: {e}")
                 self.authenticated = False
+                self.session_state = self.STATE_ERROR
+                self.session_error = str(e)
                 return False
 
         except Exception as e:
             logger.error(f"Errore in session refresh: {e}")
             self.authenticated = False
+            self.session_state = self.STATE_ERROR
+            self.session_error = str(e)
             return False
 
     async def stop_keep_alive(self):
         """Ferma il keep-alive"""
         self.keep_alive_running = False
+        task = self.keep_alive_task
+        self.keep_alive_task = None
+        if task and task is not asyncio.current_task() and not task.done():
+            task.cancel()
+            with suppress(asyncio.CancelledError):
+                await task
 
     async def _check_session_validity(self):
         """Verifica se la sessione è ancora valida"""
@@ -491,23 +619,8 @@ class BrowserManager:
             return False
 
     async def _ensure_authenticated(self):
-        """Assicura che il sistema sia autenticato, ri-autentica se necessario.
-        Prima tenta il recupero sessione senza SPID, poi fallback a login completo."""
-        if not self.authenticated or not await self._check_session_validity():
-            # Step 1: tenta recupero sessione senza SPID
-            if await self._try_session_recovery():
-                logger.info("Sessione recuperata senza login SPID")
-                return
-
-            # Step 2: fallback a login SPID completo
-            logger.info("Sessione non recuperabile, login SPID completo...")
-            try:
-                await self.login()
-                await self.start_keep_alive()
-                logger.info("Re-autenticazione SPID completata")
-            except Exception as e:
-                logger.error(f"Errore nella re-autenticazione: {e}")
-                raise AuthenticationError(f"Re-authentication failed: {e}") from e
+        """Assicura che esista una sessione pronta senza creare login concorrenti."""
+        await self.open_session()
 
     async def esegui_visura(self, request: VisuraRequest) -> VisuraResponse:
         """Esegue una visura catastale (solo dati catastali, senza intestati).
@@ -521,18 +634,27 @@ class BrowserManager:
             await self._ensure_authenticated()
 
             async def _run(tipo: str):
-                return await run_visura(
-                    self.auth_page,
-                    request.provincia,
-                    request.comune,
-                    request.sezione,
-                    request.foglio,
-                    request.particella,
-                    tipo,
-                    extract_intestati=False,
-                    subalterno=request.subalterno,
-                    codice_belfiore=request.codice_belfiore,
-                )
+                async with self.page_lock:
+                    self.session_state = self.STATE_BUSY
+                    try:
+                        result = await run_visura(
+                            self.auth_page,
+                            request.provincia,
+                            request.comune,
+                            request.sezione,
+                            request.foglio,
+                            request.particella,
+                            tipo,
+                            extract_intestati=False,
+                            subalterno=request.subalterno,
+                            codice_belfiore=request.codice_belfiore,
+                        )
+                        self.last_sister_activity = datetime.now()
+                        self.mark_client_activity()
+                        return result
+                    finally:
+                        if self.authenticated:
+                            self.session_state = self.STATE_READY
 
             try:
                 result = await _run(request.tipo_catasto)
@@ -581,6 +703,9 @@ class BrowserManager:
             )
 
         except (AuthenticationError, BrowserError) as e:
+            self.authenticated = False
+            self.session_state = self.STATE_ERROR
+            self.session_error = str(e)
             logger.error(f"Errore in visura {request.request_id}: {e}")
             return VisuraResponse(
                 request_id=request.request_id,
@@ -602,29 +727,37 @@ class BrowserManager:
         try:
             await self._ensure_authenticated()
 
-            if request.tipo_catasto == "F" and request.subalterno:
-                result = await run_visura_immobile(
-                    self.auth_page,
-                    provincia=request.provincia,
-                    comune=request.comune,
-                    sezione=request.sezione,
-                    foglio=request.foglio,
-                    particella=request.particella,
-                    subalterno=request.subalterno,
-                    codice_belfiore=request.codice_belfiore,
-                )
-            else:
-                result = await run_visura(
-                    self.auth_page,
-                    request.provincia,
-                    request.comune,
-                    request.sezione,
-                    request.foglio,
-                    request.particella,
-                    request.tipo_catasto,
-                    extract_intestati=True,
-                    codice_belfiore=request.codice_belfiore,
-                )
+            async with self.page_lock:
+                self.session_state = self.STATE_BUSY
+                try:
+                    if request.tipo_catasto == "F" and request.subalterno:
+                        result = await run_visura_immobile(
+                            self.auth_page,
+                            provincia=request.provincia,
+                            comune=request.comune,
+                            sezione=request.sezione,
+                            foglio=request.foglio,
+                            particella=request.particella,
+                            subalterno=request.subalterno,
+                            codice_belfiore=request.codice_belfiore,
+                        )
+                    else:
+                        result = await run_visura(
+                            self.auth_page,
+                            request.provincia,
+                            request.comune,
+                            request.sezione,
+                            request.foglio,
+                            request.particella,
+                            request.tipo_catasto,
+                            extract_intestati=True,
+                            codice_belfiore=request.codice_belfiore,
+                        )
+                    self.last_sister_activity = datetime.now()
+                    self.mark_client_activity()
+                finally:
+                    if self.authenticated:
+                        self.session_state = self.STATE_READY
 
             logger.info(f"Visura intestati completata per {request.request_id}")
             return VisuraResponse(
@@ -635,6 +768,9 @@ class BrowserManager:
             )
 
         except Exception as e:
+            self.authenticated = False
+            self.session_state = self.STATE_ERROR
+            self.session_error = str(e)
             logger.error(f"Errore in visura intestati {request.request_id}: {e}")
             return VisuraResponse(
                 request_id=request.request_id,
@@ -648,26 +784,15 @@ class BrowserManager:
         try:
             if self.browser and not self.browser.is_connected():
                 logger.info("Browser disconnesso, riavviando...")
-                await self.close()
-                await self.initialize()
-                await self.login()
-                await self.start_keep_alive()
+                await self.close_session(reason="browser_disconnected")
+                await self.open_session()
                 logger.info("Browser riavviato con successo")
         except Exception as e:
             logger.error(f"Errore nel riavvio browser: {e}")
             raise BrowserError(f"Failed to restart browser: {e}") from e
 
-    async def close(self):
-        """Chiude il browser e torna sempre al portale"""
-        await self.stop_keep_alive()
-        try:
-            if self.auth_page and not self.auth_page.is_closed():
-                try:
-                    await self.auth_page.get_by_role("link", name=" Torna al portale").click()
-                except Exception as e:
-                    logger.warning(f"Impossibile cliccare 'Torna al portale': {e}")
-        except Exception as e:
-            logger.warning(f"Errore durante il tentativo di tornare al portale: {e}")
+    async def _close_browser_unlocked(self):
+        """Chiude le risorse locali. Il chiamante deve possedere ``page_lock``."""
         try:
             if self.context:
                 await self.context.close()
@@ -684,20 +809,56 @@ class BrowserManager:
                 self.playwright = None
         except Exception as e:
             logger.warning(f"Errore durante lo stop di playwright: {e}")
+        self.auth_page = None
+        self.context = None
+        self.browser = None
+        self.playwright = None
+        self.authenticated = False
+        self.selected_convention = None
         logger.info("Browser chiuso")
+
+    async def _logout_and_close_browser_unlocked(self, reason: str):
+        """Prova USCITA con timeout e chiude sempre il browser locale."""
+        if self.auth_page and not self.auth_page.is_closed():
+            try:
+                logger.info(f"Effettuando logout dalla sessione (motivo={reason})...")
+                timeout = max(5, int(os.getenv("SESSION_LOGOUT_TIMEOUT_SECONDS", "20")))
+                await asyncio.wait_for(logout(self.auth_page), timeout=timeout)
+            except Exception as e:
+                logger.warning(f"Logout non completato entro il limite: {e}")
+        await self._close_browser_unlocked()
+
+    async def close_session(self, reason: str = "requested") -> dict:
+        """Chiude la sessione remota e locale senza fermare il servizio API."""
+        async with self.session_lock:
+            if self.session_state == self.STATE_LOGGED_OUT and self.browser is None:
+                return self.status_snapshot()
+            if reason == "idle_timeout" and self.last_client_activity:
+                idle_timeout = max(60, int(os.getenv("SESSION_IDLE_TIMEOUT_SECONDS", "900")))
+                idle_for = (datetime.now() - self.last_client_activity).total_seconds()
+                if idle_for < idle_timeout:
+                    logger.info("Logout inattivita' annullato: nel frattempo e' arrivata una richiesta")
+                    return self.status_snapshot()
+            self.session_state = self.STATE_CLOSING
+            async with self.page_lock:
+                await self._logout_and_close_browser_unlocked(reason=reason)
+            self.session_state = self.STATE_LOGGED_OUT
+            self.session_error = None
+            self.last_login_time = None
+            self.last_client_activity = None
+            self.last_sister_activity = None
+            return self.status_snapshot()
+
+    async def close(self):
+        """Ferma il monitor e chiude browser/sessione."""
+        await self.stop_keep_alive()
+        await self.close_session(reason="close")
 
     async def graceful_shutdown(self):
         """Effettua uno shutdown graceful con logout"""
         logger.info("Iniziando shutdown graceful...")
-
-        try:
-            if self.auth_page and not self.auth_page.is_closed():
-                logger.info("Effettuando logout dalla sessione...")
-                await logout(self.auth_page)
-        except Exception as e:
-            logger.warning(f"Errore durante il logout: {e}")
-
-        await self.close()
+        await self.stop_keep_alive()
+        await self.close_session(reason="shutdown")
         logger.info("Shutdown graceful completato")
 
 
@@ -724,15 +885,21 @@ class VisuraService:
         self.response_store: TTLCache = TTLCache(maxsize=maxsize, ttl=ttl_seconds)
 
         self.processing = False
+        self.worker_task: Optional[asyncio.Task] = None
+        self.active_request_id: Optional[str] = None
 
     async def initialize(self):
-        """Inizializza il servizio"""
-        await self.browser_manager.initialize()
-        await self.browser_manager.login()
+        """Avvia l'API senza aprire una sessione SISTER."""
         await self.browser_manager.start_keep_alive()
+        self.worker_task = asyncio.create_task(self._process_requests(), name="visura-request-worker")
 
-        # Avvia il worker per processare le richieste
-        asyncio.create_task(self._process_requests())
+    async def open_session(self) -> dict:
+        return await self.browser_manager.open_session()
+
+    async def close_session(self) -> dict:
+        if self.active_request_id or self.request_queue.qsize():
+            raise RuntimeError("Impossibile chiudere SISTER con richieste in lavorazione o in coda")
+        return await self.browser_manager.close_session(reason="api_request")
 
     async def _process_requests(self):
         """Processa le richieste in coda"""
@@ -742,21 +909,24 @@ class VisuraService:
             try:
                 request_data = await self.request_queue.get()
                 request = request_data["request"]
+                self.active_request_id = getattr(request, "request_id", None)
 
-                if isinstance(request, VisuraRequest):
-                    response = await self.browser_manager.esegui_visura(request)
-                    self.response_store[request.request_id] = response
-                    logger.info(f"Processata richiesta visura {request.request_id}")
+                try:
+                    if isinstance(request, VisuraRequest):
+                        response = await self.browser_manager.esegui_visura(request)
+                        self.response_store[request.request_id] = response
+                        logger.info(f"Processata richiesta visura {request.request_id}")
 
-                elif isinstance(request, VisuraIntestatiRequest):
-                    response = await self.browser_manager.esegui_visura_intestati(request)
-                    self.response_store[request.request_id] = response
-                    logger.info(f"Processata richiesta intestati {request.request_id}")
+                    elif isinstance(request, VisuraIntestatiRequest):
+                        response = await self.browser_manager.esegui_visura_intestati(request)
+                        self.response_store[request.request_id] = response
+                        logger.info(f"Processata richiesta intestati {request.request_id}")
 
-                else:
-                    logger.error(f"Tipo di richiesta sconosciuto: {type(request)}")
-
-                self.request_queue.task_done()
+                    else:
+                        logger.error(f"Tipo di richiesta sconosciuto: {type(request)}")
+                finally:
+                    self.active_request_id = None
+                    self.request_queue.task_done()
 
                 # Breve yield al loop per evitare burst su SISTER; il rate-limit
                 # vero è gestito dal token bucket HTTP (P1 #7). Ridotto da 2s
@@ -773,6 +943,7 @@ class VisuraService:
         Solleva ``QueueFullError`` se la coda è piena (vedi
         ``MAX_QUEUE_SIZE`` env). Gli endpoint la traducono in HTTP 429.
         """
+        await self.open_session()
         try:
             self.request_queue.put_nowait({"request": request})
         except asyncio.QueueFull as e:
@@ -788,6 +959,7 @@ class VisuraService:
         Solleva ``QueueFullError`` se la coda è piena (vedi
         ``MAX_QUEUE_SIZE`` env). Gli endpoint la traducono in HTTP 429.
         """
+        await self.open_session()
         try:
             self.request_queue.put_nowait({"request": request})
         except asyncio.QueueFull as e:
@@ -803,15 +975,24 @@ class VisuraService:
 
     async def shutdown(self):
         """Chiude il servizio"""
-        self.processing = False
+        await self._stop_worker()
         await self.browser_manager.close()
 
     async def graceful_shutdown(self):
         """Chiude il servizio con logout graceful"""
         logger.info("Iniziando graceful shutdown del servizio...")
-        self.processing = False
+        await self._stop_worker()
         await self.browser_manager.graceful_shutdown()
         logger.info("Graceful shutdown del servizio completato")
+
+    async def _stop_worker(self):
+        self.processing = False
+        task = self.worker_task
+        self.worker_task = None
+        if task and task is not asyncio.current_task() and not task.done():
+            task.cancel()
+            with suppress(asyncio.CancelledError):
+                await task
 
 
 # Global service instance - initialized during lifespan
@@ -1033,6 +1214,12 @@ async def richiedi_visura(
     except QueueFullError as e:
         logger.warning(f"Coda piena, rifiuto richiesta visura: {e}")
         raise HTTPException(status_code=429, detail=str(e))
+    except AuthenticationError as e:
+        logger.warning(f"Sessione SISTER non disponibile: {e}")
+        raise HTTPException(
+            status_code=503,
+            detail="Sessione SISTER non disponibile; controllare /health e riprovare.",
+        )
     except Exception as e:
         logger.error(f"Errore nella richiesta visura: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail="Errore interno del server. Consulta i log per i dettagli.")
@@ -1111,6 +1298,12 @@ async def richiedi_intestati_immobile(
     except QueueFullError as e:
         logger.warning(f"Coda piena, rifiuto richiesta intestati: {e}")
         raise HTTPException(status_code=429, detail=str(e))
+    except AuthenticationError as e:
+        logger.warning(f"Sessione SISTER non disponibile: {e}")
+        raise HTTPException(
+            status_code=503,
+            detail="Sessione SISTER non disponibile; controllare /health e riprovare.",
+        )
     except Exception as e:
         logger.error(f"Errore nella richiesta intestati: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail="Errore interno del server. Consulta i log per i dettagli.")
@@ -1119,13 +1312,45 @@ async def richiedi_intestati_immobile(
 @app.get("/health")
 async def health_check(service: VisuraService = Depends(get_visura_service)):
     """Controlla lo stato del servizio"""
+    session = service.browser_manager.status_snapshot()
     return JSONResponse(
         {
             "status": "healthy",
-            "authenticated": service.browser_manager.authenticated,
+            **session,
             "queue_size": service.request_queue.qsize(),
+            "active_request_id": service.active_request_id,
         }
     )
+
+
+@app.post("/session/open")
+async def open_session_endpoint(
+    service: VisuraService = Depends(get_visura_service),
+    _key: str = Depends(verify_api_key_strict),
+):
+    """Apre o rinnova l'unica sessione SISTER usata dal servizio."""
+    try:
+        session = await service.open_session()
+        return JSONResponse({"status": "ready", **session})
+    except AuthenticationError as e:
+        logger.warning(f"Apertura sessione SISTER fallita: {e}")
+        raise HTTPException(
+            status_code=503,
+            detail="Impossibile aprire la sessione SISTER; controllare /health e riprovare.",
+        )
+
+
+@app.post("/session/close")
+async def close_session_endpoint(
+    service: VisuraService = Depends(get_visura_service),
+    _key: str = Depends(verify_api_key_strict),
+):
+    """Esegue il logout quando non ci sono richieste attive o in coda."""
+    try:
+        session = await service.close_session()
+        return JSONResponse({"status": "closed", **session})
+    except RuntimeError as e:
+        raise HTTPException(status_code=409, detail=str(e))
 
 
 @app.post("/shutdown")
