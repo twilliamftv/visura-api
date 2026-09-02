@@ -1,5 +1,6 @@
 import asyncio
 import os
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
@@ -188,6 +189,38 @@ def test_choose_convention_candidate_rejects_missing_target():
 
     with pytest.raises(RuntimeError, match="non trovata"):
         utils._choose_convention_candidate(candidates, "ALTRA CONVENZIONE")
+
+
+def test_ensure_sister_context_opens_visure_from_portal_home(monkeypatch):
+    page = MagicMock()
+    page.url = "https://sister3.agenziaentrate.gov.it/Servizi/Main.do"
+    page.goto = AsyncMock()
+    page.wait_for_load_state = AsyncMock()
+    offices = MagicMock()
+    conventions = MagicMock()
+    offices.count = AsyncMock(return_value=0)
+    offices.wait_for = AsyncMock(return_value=None)
+    conventions.count = AsyncMock(return_value=0)
+
+    def locator(selector):
+        if selector == "select[name='listacom']":
+            return offices
+        if selector == 'form[name="SelConv"]':
+            return conventions
+        raise AssertionError(f"Selettore inatteso: {selector}")
+
+    page.locator.side_effect = locator
+    logger = AsyncMock()
+    monkeypatch.setattr(utils, "_select_sister_convention_if_present", AsyncMock(return_value=None))
+
+    result = asyncio.run(utils.ensure_sister_visure_context(page, logger))
+
+    assert result is None
+    page.goto.assert_awaited_once_with(
+        "https://sister3.agenziaentrate.gov.it/Visure/SceltaServizio.do?tipo=/T/TM/VCVC_",
+        timeout=30000,
+    )
+    logger.log.assert_awaited_once_with(page, "apertura_servizio_visure")
 
 
 def test_find_best_option_match_handles_aquila_with_apostrophe():
