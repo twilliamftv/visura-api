@@ -236,6 +236,41 @@ def test_wait_for_sister_login_destination_waits_for_final_redirect():
     page.wait_for_load_state.assert_awaited_once_with("domcontentloaded", timeout=30000)
 
 
+def test_confirm_sister_services_privacy_when_present():
+    page = MagicMock()
+    page.wait_for_load_state = AsyncMock()
+    confirm = MagicMock()
+    confirm.count = AsyncMock(return_value=1)
+    confirm.click = AsyncMock()
+    page.locator.return_value = confirm
+    logger = MagicMock()
+    logger.log = AsyncMock()
+
+    confirmed = asyncio.run(utils._confirm_sister_services_privacy_if_present(page, logger))
+
+    assert confirmed is True
+    page.locator.assert_called_once_with('form input[type="submit"][name="submit"][value="Conferma"]')
+    confirm.click.assert_awaited_once()
+    page.wait_for_load_state.assert_awaited_once_with("domcontentloaded", timeout=30000)
+    logger.log.assert_awaited_once_with(page, "informativa_servizi_confermata")
+
+
+def test_confirm_sister_services_privacy_is_optional():
+    page = MagicMock()
+    confirm = MagicMock()
+    confirm.count = AsyncMock(return_value=0)
+    confirm.click = AsyncMock()
+    page.locator.return_value = confirm
+    logger = MagicMock()
+    logger.log = AsyncMock()
+
+    confirmed = asyncio.run(utils._confirm_sister_services_privacy_if_present(page, logger))
+
+    assert confirmed is False
+    confirm.click.assert_not_awaited()
+    logger.log.assert_not_awaited()
+
+
 def test_direct_sister_login_continues_from_sister_service_landing(monkeypatch):
     monkeypatch.setenv("SPID_PROVIDER", "sister")
     monkeypatch.setenv("SISTER_USERNAME", "utente-test")
@@ -266,6 +301,8 @@ def test_direct_sister_login_continues_from_sister_service_landing(monkeypatch):
     monkeypatch.setattr(utils, "PageLogger", MagicMock(return_value=fake_logger))
     direct_login = AsyncMock(return_value=None)
     monkeypatch.setattr(utils, "_login_sister_direct", direct_login)
+    confirm_privacy = AsyncMock(return_value=True)
+    monkeypatch.setattr(utils, "_confirm_sister_services_privacy_if_present", confirm_privacy)
     finish_visure = AsyncMock(return_value="FONDAZIONE FOCI")
     monkeypatch.setattr(utils, "ensure_sister_visure_context", finish_visure)
 
@@ -278,6 +315,7 @@ def test_direct_sister_login_continues_from_sister_service_landing(monkeypatch):
     search.press.assert_not_awaited()
     page.get_by_role.assert_any_call("link", name="Consultazioni e Certificazioni")
     page.get_by_role.assert_any_call("link", name="Visure catastali")
+    confirm_privacy.assert_awaited_once_with(page, fake_logger)
     finish_visure.assert_awaited_once_with(page, fake_logger)
 
 
