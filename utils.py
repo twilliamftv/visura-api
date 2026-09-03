@@ -435,21 +435,6 @@ async def ensure_sister_visure_context(page: Page, logger: PageLogger) -> Option
     Lettura → ``SceltaServizio.do`` (radio ``idConv``) → Avanti →
     ``SelezioneConvenzione.do`` (ufficio provinciale ``listacom``).
     """
-    service_url = "https://sister3.agenziaentrate.gov.it/Visure/SceltaServizio.do?tipo=/T/TM/VCVC_"
-
-    # Il login diretto SISTER puo' atterrare sulla home generale del portale,
-    # non direttamente dentro il flusso Visure. In quel caso apriamo
-    # esplicitamente il servizio prima di cercare informativa, convenzione e
-    # lista degli uffici. Senza questo passaggio il login e' valido, ma la
-    # ricerca di ``listacom`` avviene nella pagina sbagliata.
-    has_offices = await page.locator("select[name='listacom']").count() != 0
-    has_conventions = await page.locator('form[name="SelConv"]').count() != 0
-    if "Informativa.do" not in page.url and not has_offices and not has_conventions:
-        print("[LOGIN] Apro il servizio Visure catastali...")
-        await page.goto(service_url, timeout=30000)
-        await page.wait_for_load_state("domcontentloaded", timeout=30000)
-        await logger.log(page, "apertura_servizio_visure")
-
     if "Informativa.do" in page.url:
         confirm = page.get_by_role("link", name=re.compile(r"Conferma\s+Lettura", re.I))
         if await confirm.count() != 1:
@@ -494,10 +479,10 @@ async def login(page: Page):
       proprie consultazioni con le proprie credenziali nominali (vedi README,
       sezione "Provider di autenticazione supportati").
 
-    Con i provider SPID il flusso prosegue identico: ricerca del servizio
-    SISTER, conferma, navigazione fino a "Visure catastali → Conferma Lettura".
-    Con il provider ``sister`` il login diretto atterra già nell'area del
-    servizio e quei passi vengono saltati.
+    Con i provider SPID il flusso prosegue dalla ricerca del servizio SISTER.
+    Con il provider ``sister`` il login diretto atterra invece nell'area dei
+    servizi SISTER (o, in alcuni casi, direttamente nel modulo Visure); i soli
+    passaggi gia' completati vengono saltati.
     """
     spid_provider = os.getenv("SPID_PROVIDER", "sielte").lower()
 
@@ -531,11 +516,10 @@ async def login(page: Page):
         await logger.log(page, "goto_login")
 
         if spid_provider == "sister":
-            # Le credenziali nominali autenticano la home ADE, ma non
-            # trasferiscono automaticamente la sessione al sottosistema
-            # Visure. Dopo il login proseguiamo quindi nello stesso percorso
-            # del portale usato dagli altri provider: Cerca SISTER → Vai al
-            # servizio → Conferma → Consultazioni → Visure catastali.
+            # Il login nominale termina gia' nella pagina iniziale dei servizi
+            # SISTER (Servizi/indexPI.jsp). Da li' si prosegue direttamente
+            # con Consultazioni e Certificazioni, senza usare la ricerca della
+            # home ADE e senza aprire a mano URL interni del modulo Visure.
             step = "provider_sister"
             await _login_sister_direct(page, logger, username, password)
         else:
@@ -551,48 +535,48 @@ async def login(page: Page):
             else:  # poste (gli altri valori sono già stati respinti sopra)
                 await _login_poste(page, logger, username, password)
 
-        step = "cerca_sister"
-        print("[LOGIN] Cerco servizio SISTER...")
-        await page.get_by_role("textbox", name="Cerca il servizio").click()
-        await page.get_by_role("textbox", name="Cerca il servizio").fill("SISTER")
-        await page.get_by_role("textbox", name="Cerca il servizio").press("Enter")
-        await logger.log(page, "cerca_sister")
+            step = "cerca_sister"
+            print("[LOGIN] Cerco servizio SISTER...")
+            await page.get_by_role("textbox", name="Cerca il servizio").click()
+            await page.get_by_role("textbox", name="Cerca il servizio").fill("SISTER")
+            await page.get_by_role("textbox", name="Cerca il servizio").press("Enter")
+            await logger.log(page, "cerca_sister")
 
-        step = "vai_al_servizio"
-        print("[LOGIN] Clicco 'Vai al servizio'...")
-        await page.get_by_role("link", name="Vai al servizio").first.click()
+            step = "vai_al_servizio"
+            print("[LOGIN] Clicco 'Vai al servizio'...")
+            await page.get_by_role("link", name="Vai al servizio").first.click()
 
-        step = "controllo_sessione"
-        print("[LOGIN] Attendo caricamento pagina...")
-        await page.wait_for_load_state("domcontentloaded")
-        await logger.log(page, "vai_al_servizio")
-        print("[LOGIN] Controllo blocco sessione...")
-        content = await page.content()
-        url = page.url
-        if "Utente gia' in sessione" in content or "error_locked.jsp" in url:
-            print("[LOGIN][ERRORE] Utente già in sessione su un'altra postazione!")
-            raise Exception("Utente già in sessione su un'altra postazione")
+            step = "controllo_sessione"
+            print("[LOGIN] Attendo caricamento pagina...")
+            await page.wait_for_load_state("domcontentloaded")
+            await logger.log(page, "vai_al_servizio")
+            print("[LOGIN] Controllo blocco sessione...")
+            content = await page.content()
+            url = page.url
+            if "Utente gia' in sessione" in content or "error_locked.jsp" in url:
+                print("[LOGIN][ERRORE] Utente già in sessione su un'altra postazione!")
+                raise Exception("Utente già in sessione su un'altra postazione")
 
-        step = "conferma"
-        print("[LOGIN] Clicco 'Conferma'...")
-        await page.get_by_role("button", name="Conferma").click()
-        await logger.log(page, "conferma")
+            step = "conferma"
+            print("[LOGIN] Clicco 'Conferma'...")
+            await page.get_by_role("button", name="Conferma").click()
+            await logger.log(page, "conferma")
 
-        step = "consultazioni"
-        print("[LOGIN] Clicco 'Consultazioni e Certificazioni'...")
-        await page.get_by_role("link", name="Consultazioni e Certificazioni").click()
-        await logger.log(page, "consultazioni")
+        # Il login diretto puo' atterrare gia' nel modulo Visure. Se invece
+        # siamo nella pagina iniziale dei servizi SISTER, usiamo i link interni
+        # che trasferiscono correttamente la sessione autenticata.
+        if "/Visure/" not in page.url:
+            step = "consultazioni"
+            print("[LOGIN] Clicco 'Consultazioni e Certificazioni'...")
+            await page.get_by_role("link", name="Consultazioni e Certificazioni").click()
+            await logger.log(page, "consultazioni")
 
-        step = "visure_catastali"
-        print("[LOGIN] Clicco 'Visure catastali'...")
-        await page.get_by_role("link", name="Visure catastali").click()
-        await logger.log(page, "visure_catastali")
+            step = "visure_catastali"
+            print("[LOGIN] Clicco 'Visure catastali'...")
+            await page.get_by_role("link", name="Visure catastali").click()
+            await logger.log(page, "visure_catastali")
 
-        step = "conferma_lettura"
-        print("[LOGIN] Clicco 'Conferma Lettura'...")
-        await page.get_by_role("link", name="Conferma Lettura").click()
-        await page.wait_for_load_state("domcontentloaded", timeout=30000)
-        await logger.log(page, "conferma_lettura")
+        step = "contesto_visure"
         selected_convention = await ensure_sister_visure_context(page, logger)
         return selected_convention
 
@@ -604,21 +588,26 @@ async def login(page: Page):
 async def _wait_for_sister_login_destination(page: Page) -> None:
     """Attende la fine della catena di redirect successiva al login diretto.
 
-    Il click su ``Accedi`` puo' caricare brevemente una pagina SISTER e poi
-    reindirizzare in modo asincrono a ``PortaleWeb/home``. Un semplice
-    ``wait_for_load_state`` puo' quindi riferirsi al documento precedente e
-    lasciare che la navigazione successiva interrompa l'apertura delle Visure.
+    Il click su ``Accedi`` attraversa brevemente la home del portale ADE e poi
+    prosegue in modo asincrono fino a ``SISTER/Servizi/indexPI.jsp``. La home
+    ADE non e' quindi una destinazione stabile: il flusso puo' continuare solo
+    quando e' comparsa la pagina iniziale dei servizi SISTER (o un blocco di
+    sessione esplicito).
     """
     try:
         await page.wait_for_function(
             """
             () => {
               const body = document.body ? document.body.innerText : '';
-              const atPortalHome = location.hostname === 'portale.agenziaentrate.gov.it'
-                && location.pathname.startsWith('/PortaleWeb/home');
+              const sisterHost = location.hostname === 'sister3.agenziaentrate.gov.it';
+              const atSisterServices = sisterHost
+                && location.pathname.endsWith('/Servizi/indexPI.jsp');
+              const insideVisure = sisterHost
+                && location.pathname.startsWith('/Visure/')
+                && !location.pathname.endsWith('/Visure/login.jsp');
               const locked = location.pathname.includes('error_locked.jsp')
                 || body.includes("Utente gia' in sessione");
-              return atPortalHome || locked;
+              return atSisterServices || insideVisure || locked;
             }
             """,
             timeout=30000,
@@ -645,9 +634,9 @@ async def _login_sister_direct(page: Page, logger: PageLogger, username: str, pa
     richiede che l'utenza sia personale, non cedibile, e che le consultazioni
     siano riconducibili all'intestatario).
 
-    Dopo il login si atterra nella home autenticata del portale ADE. Il
-    chiamante prosegue da li' attraverso il collegamento ufficiale al servizio
-    SISTER, necessario per trasferire la sessione al sottosistema Visure.
+    Dopo il login e i redirect intermedi si atterra in
+    ``SISTER/Servizi/indexPI.jsp``. Il chiamante prosegue da quella pagina
+    tramite i link interni del portale, conservando la sessione autenticata.
     """
     step = "sister_tab"
     try:
@@ -725,7 +714,7 @@ async def _login_sister_direct(page: Page, logger: PageLogger, username: str, pa
                 f"Utente già in sessione su un'altra postazione (max {MAX_CLOSE_ATTEMPTS} tentativi raggiunto)"
             )
 
-        print("[LOGIN] Autenticazione SISTER completata; apro il servizio dal portale ADE.")
+        print("[LOGIN] Autenticazione SISTER completata; pagina servizi pronta.")
         return None
 
     except Exception:
