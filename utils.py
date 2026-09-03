@@ -593,7 +593,14 @@ async def login(page: Page):
             await logger.log(page, "consultazioni")
 
             step = "informativa_servizi"
-            await _confirm_sister_services_privacy_if_present(page, logger)
+            privacy_confirmed = await _confirm_sister_services_privacy_if_present(page, logger)
+            if privacy_confirmed:
+                # La conferma dell'informativa torna alla Home dei Servizi:
+                # la sezione richiesta non viene riaperta automaticamente.
+                step = "consultazioni_dopo_informativa"
+                print("[LOGIN] Riapro 'Consultazioni e Certificazioni' dopo l'informativa...")
+                await page.get_by_role("link", name="Consultazioni e Certificazioni").click()
+                await logger.log(page, "consultazioni_dopo_informativa")
 
             step = "visure_catastali"
             print("[LOGIN] Clicco 'Visure catastali'...")
