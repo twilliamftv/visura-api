@@ -463,6 +463,27 @@ async def ensure_sister_visure_context(page: Page, logger: PageLogger) -> Option
     return selected
 
 
+async def _confirm_sister_services_privacy_if_present(page: Page, logger: PageLogger) -> bool:
+    """Conferma l'informativa mostrata entrando nelle consultazioni SISTER.
+
+    Con alcune utenze ``Consultazioni e Certificazioni`` porta prima a
+    ``Servizi/index.jsp``. Finche' il relativo form privacy non viene
+    confermato, il portale non mostra il collegamento alle Visure catastali.
+    """
+    confirm = page.locator('form input[type="submit"][name="submit"][value="Conferma"]')
+    count = await confirm.count()
+    if count == 0:
+        return False
+    if count != 1:
+        raise RuntimeError("Pagina servizi SISTER con piu' pulsanti Conferma privacy")
+
+    print("[LOGIN] Confermo l'informativa privacy dei servizi SISTER...")
+    await confirm.click()
+    await page.wait_for_load_state("domcontentloaded", timeout=30000)
+    await logger.log(page, "informativa_servizi_confermata")
+    return True
+
+
 async def login(page: Page):
     """Esegue il login completo (SPID + navigazione fino a 'Visure catastali').
 
@@ -570,6 +591,9 @@ async def login(page: Page):
             print("[LOGIN] Clicco 'Consultazioni e Certificazioni'...")
             await page.get_by_role("link", name="Consultazioni e Certificazioni").click()
             await logger.log(page, "consultazioni")
+
+            step = "informativa_servizi"
+            await _confirm_sister_services_privacy_if_present(page, logger)
 
             step = "visure_catastali"
             print("[LOGIN] Clicco 'Visure catastali'...")
