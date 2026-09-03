@@ -1,6 +1,6 @@
 import asyncio
 import os
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, call
 
 import pytest
 
@@ -314,6 +314,7 @@ def test_direct_sister_login_continues_from_sister_service_landing(monkeypatch):
     search.fill.assert_not_awaited()
     search.press.assert_not_awaited()
     page.get_by_role.assert_any_call("link", name="Consultazioni e Certificazioni")
+    assert page.get_by_role.call_args_list.count(call("link", name="Consultazioni e Certificazioni")) == 2
     page.get_by_role.assert_any_call("link", name="Visure catastali")
     confirm_privacy.assert_awaited_once_with(page, fake_logger)
     finish_visure.assert_awaited_once_with(page, fake_logger)
