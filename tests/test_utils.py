@@ -191,7 +191,7 @@ def test_choose_convention_candidate_rejects_missing_target():
         utils._choose_convention_candidate(candidates, "ALTRA CONVENZIONE")
 
 
-def test_ensure_sister_context_opens_visure_from_portal_home(monkeypatch):
+def test_ensure_sister_context_does_not_open_internal_service_url(monkeypatch):
     page = MagicMock()
     page.url = "https://sister3.agenziaentrate.gov.it/Servizi/Main.do"
     page.goto = AsyncMock()
@@ -216,11 +216,8 @@ def test_ensure_sister_context_opens_visure_from_portal_home(monkeypatch):
     result = asyncio.run(utils.ensure_sister_visure_context(page, logger))
 
     assert result is None
-    page.goto.assert_awaited_once_with(
-        "https://sister3.agenziaentrate.gov.it/Visure/SceltaServizio.do?tipo=/T/TM/VCVC_",
-        timeout=30000,
-    )
-    logger.log.assert_awaited_once_with(page, "apertura_servizio_visure")
+    page.goto.assert_not_awaited()
+    logger.log.assert_not_awaited()
 
 
 def test_wait_for_sister_login_destination_waits_for_final_redirect():
@@ -232,18 +229,20 @@ def test_wait_for_sister_login_destination_waits_for_final_redirect():
 
     page.wait_for_function.assert_awaited_once()
     script = page.wait_for_function.await_args.args[0]
-    assert "portale.agenziaentrate.gov.it" in script
-    assert "/PortaleWeb/home" in script
+    assert "sister3.agenziaentrate.gov.it" in script
+    assert "/Servizi/indexPI.jsp" in script
+    assert "/Visure/" in script
+    assert "/Visure/login.jsp" in script
     page.wait_for_load_state.assert_awaited_once_with("domcontentloaded", timeout=30000)
 
 
-def test_direct_sister_login_continues_through_ade_portal(monkeypatch):
+def test_direct_sister_login_continues_from_sister_service_landing(monkeypatch):
     monkeypatch.setenv("SPID_PROVIDER", "sister")
     monkeypatch.setenv("SISTER_USERNAME", "utente-test")
     monkeypatch.setenv("SISTER_PASSWORD", "password-test")
 
     page = MagicMock()
-    page.url = "https://portale.agenziaentrate.gov.it/PortaleWeb/home"
+    page.url = "https://sister3.agenziaentrate.gov.it/Servizi/indexPI.jsp"
     page.goto = AsyncMock()
     page.wait_for_load_state = AsyncMock()
     page.content = AsyncMock(return_value="<html></html>")
@@ -274,12 +273,35 @@ def test_direct_sister_login_continues_through_ade_portal(monkeypatch):
 
     assert selected == "FONDAZIONE FOCI"
     direct_login.assert_awaited_once()
-    search.fill.assert_awaited_once_with("SISTER")
-    search.press.assert_awaited_once_with("Enter")
-    page.get_by_role.assert_any_call("link", name="Vai al servizio")
-    page.get_by_role.assert_any_call("button", name="Conferma")
+    search.click.assert_not_awaited()
+    search.fill.assert_not_awaited()
+    search.press.assert_not_awaited()
     page.get_by_role.assert_any_call("link", name="Consultazioni e Certificazioni")
     page.get_by_role.assert_any_call("link", name="Visure catastali")
+    finish_visure.assert_awaited_once_with(page, fake_logger)
+
+
+def test_direct_sister_login_already_inside_visure_skips_service_menu(monkeypatch):
+    monkeypatch.setenv("SPID_PROVIDER", "sister")
+    monkeypatch.setenv("SISTER_USERNAME", "utente-test")
+    monkeypatch.setenv("SISTER_PASSWORD", "password-test")
+
+    page = MagicMock()
+    page.url = "https://sister3.agenziaentrate.gov.it/Visure/Informativa.do?tipo=/T/TM/VCVC_"
+    page.goto = AsyncMock()
+    page.get_by_role = MagicMock()
+
+    fake_logger = MagicMock()
+    fake_logger.log = AsyncMock()
+    monkeypatch.setattr(utils, "PageLogger", MagicMock(return_value=fake_logger))
+    monkeypatch.setattr(utils, "_login_sister_direct", AsyncMock(return_value=None))
+    finish_visure = AsyncMock(return_value="FONDAZIONE FOCI")
+    monkeypatch.setattr(utils, "ensure_sister_visure_context", finish_visure)
+
+    selected = asyncio.run(utils.login(page))
+
+    assert selected == "FONDAZIONE FOCI"
+    page.get_by_role.assert_not_called()
     finish_visure.assert_awaited_once_with(page, fake_logger)
 
 
