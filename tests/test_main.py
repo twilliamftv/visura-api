@@ -543,6 +543,8 @@ def test_browser_manager_opens_only_one_concurrent_session():
         def __init__(self):
             super().__init__()
             self.login_calls = 0
+            self.login_started = asyncio.Event()
+            self.allow_login = asyncio.Event()
 
         async def initialize(self):
             self.browser = object()
@@ -550,7 +552,8 @@ def test_browser_manager_opens_only_one_concurrent_session():
 
         async def login(self):
             self.login_calls += 1
-            await asyncio.sleep(0)
+            self.login_started.set()
+            await self.allow_login.wait()
             self.auth_page = OpenPage()
             self.authenticated = True
 
@@ -560,8 +563,9 @@ def test_browser_manager_opens_only_one_concurrent_session():
     async def scenario():
         manager = TestBrowserManager()
         first_task = asyncio.create_task(manager.open_session())
-        await asyncio.sleep(0)
+        await asyncio.wait_for(manager.login_started.wait(), timeout=0.1)
         second = await asyncio.wait_for(manager.open_session(), timeout=0.1)
+        manager.allow_login.set()
         first = await first_task
         assert manager.login_calls == 1
         assert first["session_state"] == "ready"
