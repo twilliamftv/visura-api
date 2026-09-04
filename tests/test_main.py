@@ -559,10 +559,14 @@ def test_browser_manager_opens_only_one_concurrent_session():
 
     async def scenario():
         manager = TestBrowserManager()
-        first, second = await asyncio.gather(manager.open_session(), manager.open_session())
+        first_task = asyncio.create_task(manager.open_session())
+        await asyncio.sleep(0)
+        second = await asyncio.wait_for(manager.open_session(), timeout=0.1)
+        first = await first_task
         assert manager.login_calls == 1
         assert first["session_state"] == "ready"
-        assert second["session_state"] == "ready"
+        assert second["session_state"] == "opening"
+        assert second["authenticated"] is False
 
     asyncio.run(scenario())
 

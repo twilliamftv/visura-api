@@ -374,8 +374,10 @@ class BrowserManager:
         }
 
     async def open_session(self) -> dict:
-        """Apre una sola sessione SISTER, su richiesta e con accesso serializzato."""
+        """Apre una sola sessione SISTER senza accodare aperture duplicate."""
         self.mark_client_activity()
+        if self.session_lock.locked():
+            return self.status_snapshot()
         async with self.session_lock:
             if (
                 self.session_state in {self.STATE_READY, self.STATE_BUSY}
@@ -1331,7 +1333,9 @@ async def open_session_endpoint(
     """Apre o rinnova l'unica sessione SISTER usata dal servizio."""
     try:
         session = await service.open_session()
-        return JSONResponse({"status": "ready", **session})
+        state = str(session.get("session_state") or "error")
+        status = "ready" if session.get("authenticated") is True else state
+        return JSONResponse({"status": status, **session})
     except AuthenticationError as e:
         logger.warning(f"Apertura sessione SISTER fallita: {e}")
         raise HTTPException(
