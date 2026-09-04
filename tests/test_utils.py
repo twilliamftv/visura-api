@@ -230,7 +230,9 @@ def test_wait_for_sister_login_destination_waits_for_final_redirect():
     page.wait_for_function.assert_awaited_once()
     script = page.wait_for_function.await_args.args[0]
     assert "sister3.agenziaentrate.gov.it" in script
-    assert "/Servizi/indexPI.jsp" in script
+    assert "location.pathname.replace(/\\/+$/, '')" in script
+    assert "servicesPath === '/Servizi'" in script
+    assert "servicesPath === '/Servizi/indexPI.jsp'" in script
     assert "/Visure/" in script
     assert "/Visure/login.jsp" in script
     page.wait_for_load_state.assert_awaited_once_with("domcontentloaded", timeout=30000)
