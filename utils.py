@@ -642,8 +642,11 @@ async def _wait_for_sister_login_destination(page: Page) -> None:
             () => {
               const body = document.body ? document.body.innerText : '';
               const sisterHost = location.hostname === 'sister3.agenziaentrate.gov.it';
-              const atSisterServices = sisterHost
-                && location.pathname.endsWith('/Servizi/indexPI.jsp');
+              const servicesPath = location.pathname.replace(/\/+$/, '');
+              const atSisterServices = sisterHost && (
+                servicesPath === '/Servizi'
+                || servicesPath === '/Servizi/indexPI.jsp'
+              );
               const insideVisure = sisterHost
                 && location.pathname.startsWith('/Visure/')
                 && !location.pathname.endsWith('/Visure/login.jsp');
