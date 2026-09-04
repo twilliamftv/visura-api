@@ -638,7 +638,7 @@ async def _wait_for_sister_login_destination(page: Page) -> None:
     """
     try:
         await page.wait_for_function(
-            """
+            r"""
             () => {
               const body = document.body ? document.body.innerText : '';
               const sisterHost = location.hostname === 'sister3.agenziaentrate.gov.it';
