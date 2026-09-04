@@ -320,6 +320,50 @@ def test_direct_sister_login_continues_from_sister_service_landing(monkeypatch):
     finish_visure.assert_awaited_once_with(page, fake_logger)
 
 
+def test_direct_sister_login_reopens_consultations_when_visure_link_is_missing(monkeypatch):
+    monkeypatch.setenv("SPID_PROVIDER", "sister")
+    monkeypatch.setenv("SISTER_USERNAME", "utente-test")
+    monkeypatch.setenv("SISTER_PASSWORD", "password-test")
+
+    page = MagicMock()
+    page.url = "https://sister3.agenziaentrate.gov.it/Servizi/indexPI.jsp"
+    page.goto = AsyncMock()
+    page.content = AsyncMock(return_value="<html></html>")
+
+    consultations = MagicMock()
+    consultations.click = AsyncMock()
+    visure = MagicMock()
+    visure.wait_for = AsyncMock(side_effect=utils.PlaywrightTimeoutError("link assente"))
+    visure.click = AsyncMock()
+    generic = MagicMock()
+    generic.click = AsyncMock()
+    generic.first = generic
+
+    def get_by_role(role, name=None, **_kwargs):
+        if role == "link" and name == "Consultazioni e Certificazioni":
+            return consultations
+        if role == "link" and name == "Visure catastali":
+            return visure
+        return generic
+
+    page.get_by_role.side_effect = get_by_role
+    fake_logger = MagicMock()
+    fake_logger.log = AsyncMock()
+    monkeypatch.setattr(utils, "PageLogger", MagicMock(return_value=fake_logger))
+    monkeypatch.setattr(utils, "_login_sister_direct", AsyncMock(return_value=None))
+    monkeypatch.setattr(utils, "_confirm_sister_services_privacy_if_present", AsyncMock(return_value=False))
+    finish_visure = AsyncMock(return_value="FONDAZIONE FOCI")
+    monkeypatch.setattr(utils, "ensure_sister_visure_context", finish_visure)
+
+    selected = asyncio.run(utils.login(page))
+
+    assert selected == "FONDAZIONE FOCI"
+    assert consultations.click.await_count == 2
+    visure.wait_for.assert_awaited_once_with(state="attached", timeout=3000)
+    visure.click.assert_awaited_once()
+    finish_visure.assert_awaited_once_with(page, fake_logger)
+
+
 def test_direct_sister_login_already_inside_visure_skips_service_menu(monkeypatch):
     monkeypatch.setenv("SPID_PROVIDER", "sister")
     monkeypatch.setenv("SISTER_USERNAME", "utente-test")

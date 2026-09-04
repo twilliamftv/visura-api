@@ -594,18 +594,29 @@ async def login(page: Page):
 
             step = "informativa_servizi"
             privacy_confirmed = await _confirm_sister_services_privacy_if_present(page, logger)
-            if privacy_confirmed:
-                # La conferma dell'informativa torna alla Home dei Servizi:
-                # la sezione richiesta non viene riaperta automaticamente.
-                step = "consultazioni_dopo_informativa"
-                print("[LOGIN] Riapro 'Consultazioni e Certificazioni' dopo l'informativa...")
-                await page.get_by_role("link", name="Consultazioni e Certificazioni").click()
-                await logger.log(page, "consultazioni_dopo_informativa")
+            if "/Visure/" not in page.url:
+                visure_link = page.get_by_role("link", name="Visure catastali")
+                reopen_consultations = privacy_confirmed
+                if not reopen_consultations:
+                    try:
+                        await visure_link.wait_for(state="attached", timeout=3000)
+                    except PlaywrightTimeoutError:
+                        reopen_consultations = True
 
-            step = "visure_catastali"
-            print("[LOGIN] Clicco 'Visure catastali'...")
-            await page.get_by_role("link", name="Visure catastali").click()
-            await logger.log(page, "visure_catastali")
+                if reopen_consultations:
+                    # La conferma dell'informativa e alcuni ritorni dal portale
+                    # lasciano l'utente nella Home dei Servizi. Riaprire la
+                    # sezione rende il flusso stabile anche con privacy gia' letta.
+                    step = "consultazioni_dopo_informativa"
+                    print("[LOGIN] Riapro 'Consultazioni e Certificazioni'...")
+                    await page.get_by_role("link", name="Consultazioni e Certificazioni").click()
+                    await logger.log(page, "consultazioni_dopo_informativa")
+                    visure_link = page.get_by_role("link", name="Visure catastali")
+
+                step = "visure_catastali"
+                print("[LOGIN] Clicco 'Visure catastali'...")
+                await visure_link.click()
+                await logger.log(page, "visure_catastali")
 
         step = "contesto_visure"
         selected_convention = await ensure_sister_visure_context(page, logger)
