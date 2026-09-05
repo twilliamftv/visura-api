@@ -390,6 +390,158 @@ def test_direct_sister_login_already_inside_visure_skips_service_menu(monkeypatc
     finish_visure.assert_awaited_once_with(page, fake_logger)
 
 
+def test_login_preselects_configured_sister_office(monkeypatch):
+    monkeypatch.setenv("SPID_PROVIDER", "sister")
+    monkeypatch.setenv("SISTER_USERNAME", "utente-test")
+    monkeypatch.setenv("SISTER_PASSWORD", "password-test")
+    monkeypatch.setenv("SISTER_OFFICE", "Isernia")
+
+    page = MagicMock()
+    page.url = "https://sister3.agenziaentrate.gov.it/Visure/Informativa.do?tipo=/T/TM/VCVC_"
+    page.goto = AsyncMock()
+
+    fake_logger = MagicMock()
+    fake_logger.log = AsyncMock()
+    monkeypatch.setattr(utils, "PageLogger", MagicMock(return_value=fake_logger))
+    monkeypatch.setattr(utils, "_login_sister_direct", AsyncMock(return_value=None))
+    monkeypatch.setattr(utils, "ensure_sister_visure_context", AsyncMock(return_value="FONDAZIONE FOCI"))
+    prepare = AsyncMock(return_value="ISERNIA Territorio-IS")
+    monkeypatch.setattr(utils, "prepare_sister_immobile_search", prepare)
+
+    selected = asyncio.run(utils.login(page))
+
+    assert selected == "FONDAZIONE FOCI"
+    prepare.assert_awaited_once_with(page, "Isernia", fake_logger, label_prefix="login")
+
+
+def test_prepare_sister_immobile_search_reuses_ready_form():
+    utils._ACTIVE_SISTER_OFFICE.update(
+        {"name_norm": "isernia", "value": "ISERNIA Territorio-IS"}
+    )
+    page = MagicMock()
+    form = MagicMock()
+    form.count = AsyncMock(return_value=1)
+    page.locator.return_value = form
+    page.goto = AsyncMock()
+    page.get_by_role = MagicMock()
+    page_logger = MagicMock()
+    page_logger.log = AsyncMock()
+
+    result = asyncio.run(
+        utils.prepare_sister_immobile_search(page, "Isernia", page_logger)
+    )
+
+    assert result == "ISERNIA Territorio-IS"
+    page.goto.assert_not_awaited()
+    page.get_by_role.assert_not_called()
+    page_logger.log.assert_not_awaited()
+
+
+def test_prepare_sister_immobile_search_clicks_existing_immobile_link_immediately():
+    utils._ACTIVE_SISTER_OFFICE.update(
+        {"name_norm": "isernia", "value": "ISERNIA Territorio-IS"}
+    )
+    page = MagicMock()
+    form = MagicMock()
+    form.count = AsyncMock(return_value=0)
+    page.locator.return_value = form
+    page.goto = AsyncMock()
+    page.wait_for_selector = AsyncMock()
+
+    immobile = MagicMock()
+    immobile.count = AsyncMock(return_value=1)
+    immobile.click = AsyncMock()
+    immobile.first = immobile
+    page.get_by_role.return_value = immobile
+    page_logger = MagicMock()
+    page_logger.log = AsyncMock()
+
+    result = asyncio.run(
+        utils.prepare_sister_immobile_search(page, "Isernia", page_logger)
+    )
+
+    assert result == "ISERNIA Territorio-IS"
+    immobile.click.assert_awaited_once_with(no_wait_after=True)
+    page.wait_for_selector.assert_awaited_once_with(
+        "select[name='denomComune']", state="attached", timeout=10000
+    )
+    page.goto.assert_not_awaited()
+    page_logger.log.assert_awaited_once_with(page, "immobile_riutilizzato")
+
+
+def test_prepare_sister_immobile_search_selects_office_from_current_page(monkeypatch):
+    page = MagicMock()
+    page.goto = AsyncMock()
+
+    form = MagicMock()
+    form.count = AsyncMock(return_value=0)
+    office = MagicMock()
+    office.count = AsyncMock(return_value=1)
+    office.select_option = AsyncMock()
+    office_options = MagicMock()
+    office_options.count = AsyncMock(return_value=2)
+    apply_button = MagicMock()
+    apply_button.click = AsyncMock()
+
+    locators = {
+        "select[name='denomComune']": form,
+        "select[name='listacom']": office,
+        "select[name='listacom'] option": office_options,
+        "input[type='submit'][value='Applica']": apply_button,
+    }
+    page.locator.side_effect = lambda selector: locators[selector]
+
+    immobile = MagicMock()
+    immobile.first = immobile
+    immobile.click = AsyncMock()
+    page.get_by_role.return_value = immobile
+
+    page_logger = MagicMock()
+    page_logger.log = AsyncMock()
+    wait_ready = AsyncMock()
+    monkeypatch.setattr(utils, "_wait_for_ready", wait_ready)
+    monkeypatch.setattr(
+        utils,
+        "_collect_options_fast",
+        AsyncMock(return_value=[["ISERNIA Territorio-IS", "ISERNIA Territorio"]]),
+    )
+    monkeypatch.setattr(
+        utils,
+        "find_best_option_match",
+        AsyncMock(return_value="ISERNIA Territorio-IS"),
+    )
+
+    result = asyncio.run(
+        utils.prepare_sister_immobile_search(page, "Isernia", page_logger, label_prefix="login")
+    )
+
+    assert result == "ISERNIA Territorio-IS"
+    page.goto.assert_not_awaited()
+    office.select_option.assert_awaited_once_with("ISERNIA Territorio-IS")
+    apply_button.click.assert_awaited_once_with(no_wait_after=True)
+    immobile.click.assert_awaited_once_with(no_wait_after=True)
+    assert wait_ready.await_count == 2
+    assert utils._ACTIVE_SISTER_OFFICE == {
+        "name_norm": "isernia",
+        "value": "ISERNIA Territorio-IS",
+    }
+
+
+def test_wait_for_visura_search_outcome_uses_dom_markers():
+    page = MagicMock()
+    page.wait_for_function = AsyncMock()
+
+    asyncio.run(utils._wait_for_visura_search_outcome(page))
+
+    page.wait_for_function.assert_awaited_once()
+    script = page.wait_for_function.await_args.args[0]
+    assert "confAssSub" in script
+    assert "table.listaIsp4" in script
+    assert "NESSUNA CORRISPONDENZA TROVATA" in script
+    assert page.wait_for_function.await_args.args[1] is True
+    assert page.wait_for_function.await_args.kwargs["timeout"] == 30000
+
+
 def test_find_best_option_match_handles_aquila_with_apostrophe():
     """Caso F-NEW1: input ISTAT `L'Aquila`, option SISTER `L'AQUILA Territorio`."""
     page = _FakePageForMatch(

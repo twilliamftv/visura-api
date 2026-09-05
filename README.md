@@ -60,6 +60,7 @@ Entrambe le richieste vengono accodate ed eseguite sequenzialmente su un singolo
 - **Coda sequenziale** — le richieste vengono processate una alla volta per non sovraccaricare il portale
 - **Sessione unica e lazy** — il browser SISTER viene aperto alla prima richiesta o tramite `POST /session/open`, mai in parallelo
 - **Convenzioni multiple** — selezione esplicita tramite `SISTER_CONVENTION`, senza scegliere automaticamente la prima convenzione
+- **Ufficio preselezionato** — con `SISTER_OFFICE` la sessione resta pronta sul modulo Immobile e riusa l'ufficio tra le richieste
 - **Keep-alive serializzato** — il rinnovo usa lo stesso lock delle visure e non può navigare mentre una richiesta è in corso
 - **Logout per inattività** — la sessione viene chiusa dopo un intervallo configurabile senza richieste del client
 - **Graceful shutdown** — su `SIGINT`/`SIGTERM` il servizio effettua il logout dal portale prima di chiudere il browser
@@ -208,6 +209,7 @@ SPID_PROVIDER=sister
 SISTER_USERNAME=utente_sister
 SISTER_PASSWORD=password_sister
 SISTER_CONVENTION=FONDAZIONE FOCI
+SISTER_OFFICE=Isernia
 
 # Opzionale
 LOG_LEVEL=INFO                    # DEBUG | INFO | WARNING | ERROR
@@ -221,6 +223,7 @@ LOG_LEVEL=INFO                    # DEBUG | INFO | WARNING | ERROR
 | `SISTER_USERNAME` | Per `sister` | — | Utente nominale SISTER |
 | `SISTER_PASSWORD` | Per `sister` | — | Password SISTER |
 | `SISTER_CONVENTION` | Con più convenzioni | — | Parte univoca dell'etichetta della convenzione, es. `FONDAZIONE FOCI` |
+| `SISTER_OFFICE` | | — | Ufficio provinciale preselezionato all'apertura e dopo il keep-alive, es. `Isernia` |
 | `SESSION_KEEPALIVE_SECONDS` | | `60` | Rinnovo dall'ultima navigazione SISTER completata |
 | `SESSION_IDLE_TIMEOUT_SECONDS` | | `900` | Logout dopo inattività del client |
 | `LOG_LEVEL` | | `INFO` | Livello di log su console e file |
@@ -684,12 +687,13 @@ Il browser viene lanciato con `handle_sigint=False, handle_sigterm=False` per im
 6. Cerca "SISTER" tra i servizi → clicca "Vai al servizio"
 7. Verifica assenza di sessione bloccata ("Utente già in sessione")
 8. Naviga: Conferma → Consultazioni e Certificazioni → Visure catastali → Conferma Lettura
-9. Se sono presenti più convenzioni, sceglie quella configurata e prosegue alla selezione dell'ufficio
+9. Se sono presenti più convenzioni, sceglie quella configurata
+10. Se `SISTER_OFFICE` è impostato, seleziona l'ufficio e lascia già pronto il modulo Immobile
 
 ### Flusso della visura
 
-1. Naviga a `SceltaServizio.do` — seleziona provincia — clicca Applica
-2. Clicca "Immobile" — seleziona tipo catasto (`T`/`F`), comune, compila foglio e particella
+1. Riusa il modulo Immobile già pronto; solo se necessario seleziona provincia e clicca Applica
+2. Seleziona tipo catasto (`T`/`F`), comune, compila foglio e particella
 3. Clicca "Ricerca" — gestisce eventuale "conferma assenza subalterno"
 4. Se "NESSUNA CORRISPONDENZA TROVATA" → ritorna risultato vuoto con `.error`
 5. Estrae la tabella immobili (`table.listaIsp4`)

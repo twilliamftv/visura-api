@@ -8,6 +8,7 @@ e questo progetto aderisce al [Versionamento Semantico](https://semver.org/lang/
 ## [Non rilasciato]
 
 ### Aggiunto
+- Preselezione opzionale dell'ufficio SISTER tramite `SISTER_OFFICE`, applicata all'apertura e dopo il keep-alive.
 - Licenza AGPL v3 (passaggio da GPL v3 per chiudere la SaaS loophole)
 - File CONTRIBUTING.md, CODE_OF_CONDUCT.md, SECURITY.md
 - Configurazione CI con GitHub Actions
@@ -33,6 +34,7 @@ e questo progetto aderisce al [Versionamento Semantico](https://semver.org/lang/
 - Rimosse dipendenze `sqlalchemy` e `psycopg[binary]`
 
 ### Corretto
+- Ridotte le attese delle visure: riuso dell'ufficio attivo e avanzamento appena compare l'elemento necessario, con fallback al percorso completo.
 - Rimosso `sys.exit(0)` duplicato nel gestore dei segnali
 - **Stabilità Docker**: rimosso flag Chromium `--single-process` (incompatibile con Docker, causava crash sporadici al re-init) e aggiunta chiusura esplicita dell'istanza Playwright precedente in `BrowserManager.initialize()` e `BrowserManager.close()` per evitare processi Chromium orfani durante session recovery e shutdown
 - **Robustezza `PageLogger`**: la creazione della directory di logging ora è tollerante ai filesystem read-only o privi di permessi di scrittura. La risoluzione avviene in cascata (`PAGES_LOG_DIR` env → variabile di modulo `PAGES_LOG_DIR` → fallback `/tmp/visura-api/logs/pages` → disabilitazione silenziosa), evitando crash all'avvio in container con application directory in sola lettura o senza volume montato.

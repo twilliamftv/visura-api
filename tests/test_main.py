@@ -1,5 +1,6 @@
 import asyncio
 import json
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 from fastapi import HTTPException
@@ -615,6 +616,41 @@ def test_session_refresh_waits_for_page_lock():
         assert called.is_set()
 
     asyncio.run(scenario())
+
+
+def test_session_refresh_restores_configured_office_search_form(monkeypatch):
+    monkeypatch.setenv("SISTER_OFFICE", "Isernia")
+    page = MagicMock()
+    page.goto = AsyncMock()
+    page.is_closed.return_value = False
+
+    manager = main.BrowserManager()
+    manager.auth_page = page
+    manager.authenticated = True
+    manager.session_state = manager.STATE_READY
+
+    ensure_context = AsyncMock(return_value="FONDAZIONE FOCI")
+    prepare = AsyncMock(return_value="ISERNIA Territorio-IS")
+    monkeypatch.setattr(main, "ensure_sister_visure_context", ensure_context)
+    monkeypatch.setattr(main, "prepare_sister_immobile_search", prepare)
+
+    refreshed = asyncio.run(manager._perform_session_refresh_unlocked())
+
+    assert refreshed is True
+    page.goto.assert_awaited_once_with(
+        "https://sister3.agenziaentrate.gov.it/Visure/SceltaServizio.do?tipo=/T/TM/VCVC_",
+        timeout=30000,
+        wait_until="domcontentloaded",
+    )
+    ensure_context.assert_awaited_once()
+    refresh_logger = ensure_context.await_args.args[1]
+    prepare.assert_awaited_once_with(
+        page,
+        "Isernia",
+        refresh_logger,
+        label_prefix="refresh",
+    )
+    assert manager.last_sister_activity is not None
 
 
 def test_idle_logout_is_cancelled_when_new_activity_arrives():
