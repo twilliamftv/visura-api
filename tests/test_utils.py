@@ -1,6 +1,6 @@
 import asyncio
 import os
-from unittest.mock import AsyncMock, MagicMock, call
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
@@ -240,10 +240,10 @@ def test_wait_for_sister_login_destination_waits_for_final_redirect():
 
 def test_confirm_sister_services_privacy_when_present():
     page = MagicMock()
-    page.wait_for_load_state = AsyncMock()
     confirm = MagicMock()
     confirm.count = AsyncMock(return_value=1)
     confirm.click = AsyncMock()
+    confirm.wait_for = AsyncMock()
     page.locator.return_value = confirm
     logger = MagicMock()
     logger.log = AsyncMock()
@@ -251,9 +251,9 @@ def test_confirm_sister_services_privacy_when_present():
     confirmed = asyncio.run(utils._confirm_sister_services_privacy_if_present(page, logger))
 
     assert confirmed is True
-    page.locator.assert_called_once_with('form input[type="submit"][name="submit"][value="Conferma"]')
-    confirm.click.assert_awaited_once()
-    page.wait_for_load_state.assert_awaited_once_with("domcontentloaded", timeout=30000)
+    page.locator.assert_called_once_with(utils._SISTER_SERVICES_PRIVACY_SELECTOR)
+    confirm.click.assert_awaited_once_with(no_wait_after=True)
+    confirm.wait_for.assert_awaited_once_with(state="detached", timeout=30000)
     logger.log.assert_awaited_once_with(page, "informativa_servizi_confermata")
 
 
@@ -271,6 +271,62 @@ def test_confirm_sister_services_privacy_is_optional():
     assert confirmed is False
     confirm.click.assert_not_awaited()
     logger.log.assert_not_awaited()
+
+
+def test_wait_for_sister_consultations_outcome_detects_visure_service():
+    page = MagicMock()
+    page.url = "https://sister3.agenziaentrate.gov.it/Servizi/SceltaServizio.do"
+
+    combined = MagicMock()
+    combined.first = combined
+    combined.wait_for = AsyncMock()
+    privacy = MagicMock()
+    privacy.count = AsyncMock(return_value=0)
+    service = MagicMock()
+    service.count = AsyncMock(return_value=1)
+
+    combined_selector = (
+        f"{utils._SISTER_SERVICES_PRIVACY_SELECTOR}, "
+        f"{utils._SISTER_VISURE_SERVICE_SELECTOR}"
+    )
+    page.locator.side_effect = lambda selector: {
+        combined_selector: combined,
+        utils._SISTER_SERVICES_PRIVACY_SELECTOR: privacy,
+        utils._SISTER_VISURE_SERVICE_SELECTOR: service,
+    }[selector]
+
+    outcome = asyncio.run(utils._wait_for_sister_consultations_outcome(page))
+
+    assert outcome == "service"
+    combined.wait_for.assert_awaited_once_with(state="attached", timeout=15000)
+
+
+def test_open_sister_consultations_retries_with_internal_url(monkeypatch):
+    page = MagicMock()
+    consultations = MagicMock()
+    consultations.wait_for = AsyncMock()
+    consultations.click = AsyncMock()
+    page.get_by_role.return_value = consultations
+    page.goto = AsyncMock()
+    logger = MagicMock()
+    logger.log = AsyncMock()
+    wait_outcome = AsyncMock(side_effect=["missing", "service"])
+    monkeypatch.setattr(utils, "_wait_for_sister_consultations_outcome", wait_outcome)
+
+    outcome = asyncio.run(
+        utils._open_sister_consultations(page, logger, log_step="consultazioni")
+    )
+
+    assert outcome == "service"
+    consultations.wait_for.assert_awaited_once_with(state="attached", timeout=15000)
+    consultations.click.assert_awaited_once_with(no_wait_after=True)
+    page.goto.assert_awaited_once_with(
+        utils._SISTER_CONSULTATIONS_URL,
+        timeout=30000,
+        wait_until="domcontentloaded",
+    )
+    assert wait_outcome.await_count == 2
+    logger.log.assert_awaited_once_with(page, "consultazioni")
 
 
 def test_direct_sister_login_continues_from_sister_service_landing(monkeypatch):
@@ -303,8 +359,8 @@ def test_direct_sister_login_continues_from_sister_service_landing(monkeypatch):
     monkeypatch.setattr(utils, "PageLogger", MagicMock(return_value=fake_logger))
     direct_login = AsyncMock(return_value=None)
     monkeypatch.setattr(utils, "_login_sister_direct", direct_login)
-    confirm_privacy = AsyncMock(return_value=True)
-    monkeypatch.setattr(utils, "_confirm_sister_services_privacy_if_present", confirm_privacy)
+    open_visure = AsyncMock(return_value=None)
+    monkeypatch.setattr(utils, "_open_sister_visure_from_services", open_visure)
     finish_visure = AsyncMock(return_value="FONDAZIONE FOCI")
     monkeypatch.setattr(utils, "ensure_sister_visure_context", finish_visure)
 
@@ -315,55 +371,62 @@ def test_direct_sister_login_continues_from_sister_service_landing(monkeypatch):
     search.click.assert_not_awaited()
     search.fill.assert_not_awaited()
     search.press.assert_not_awaited()
-    page.get_by_role.assert_any_call("link", name="Consultazioni e Certificazioni")
-    assert page.get_by_role.call_args_list.count(call("link", name="Consultazioni e Certificazioni")) == 2
-    page.get_by_role.assert_any_call("link", name="Visure catastali")
-    confirm_privacy.assert_awaited_once_with(page, fake_logger)
+    open_visure.assert_awaited_once_with(page, fake_logger)
     finish_visure.assert_awaited_once_with(page, fake_logger)
 
 
-def test_direct_sister_login_reopens_consultations_when_visure_link_is_missing(monkeypatch):
-    monkeypatch.setenv("SPID_PROVIDER", "sister")
-    monkeypatch.setenv("SISTER_USERNAME", "utente-test")
-    monkeypatch.setenv("SISTER_PASSWORD", "password-test")
-
+def test_open_sister_visure_reopens_consultations_after_privacy(monkeypatch):
     page = MagicMock()
     page.url = "https://sister3.agenziaentrate.gov.it/Servizi/indexPI.jsp"
-    page.goto = AsyncMock()
-    page.content = AsyncMock(return_value="<html></html>")
-
-    consultations = MagicMock()
-    consultations.click = AsyncMock()
     visure = MagicMock()
-    visure.wait_for = AsyncMock(side_effect=utils.PlaywrightTimeoutError("link assente"))
+    visure.first = visure
     visure.click = AsyncMock()
-    generic = MagicMock()
-    generic.click = AsyncMock()
-    generic.first = generic
-
-    def get_by_role(role, name=None, **_kwargs):
-        if role == "link" and name == "Consultazioni e Certificazioni":
-            return consultations
-        if role == "link" and name == "Visure catastali":
-            return visure
-        return generic
-
-    page.get_by_role.side_effect = get_by_role
+    page.locator.return_value = visure
     fake_logger = MagicMock()
     fake_logger.log = AsyncMock()
-    monkeypatch.setattr(utils, "PageLogger", MagicMock(return_value=fake_logger))
-    monkeypatch.setattr(utils, "_login_sister_direct", AsyncMock(return_value=None))
-    monkeypatch.setattr(utils, "_confirm_sister_services_privacy_if_present", AsyncMock(return_value=False))
-    finish_visure = AsyncMock(return_value="FONDAZIONE FOCI")
-    monkeypatch.setattr(utils, "ensure_sister_visure_context", finish_visure)
+    open_consultations = AsyncMock(side_effect=["privacy", "service"])
+    confirm_privacy = AsyncMock(return_value=True)
+    wait_entry = AsyncMock()
+    monkeypatch.setattr(utils, "_open_sister_consultations", open_consultations)
+    monkeypatch.setattr(utils, "_confirm_sister_services_privacy_if_present", confirm_privacy)
+    monkeypatch.setattr(utils, "_wait_for_sister_visure_entry", wait_entry)
 
-    selected = asyncio.run(utils.login(page))
+    asyncio.run(utils._open_sister_visure_from_services(page, fake_logger))
 
-    assert selected == "FONDAZIONE FOCI"
-    assert consultations.click.await_count == 2
-    visure.wait_for.assert_awaited_once_with(state="attached", timeout=3000)
-    visure.click.assert_awaited_once()
-    finish_visure.assert_awaited_once_with(page, fake_logger)
+    assert open_consultations.await_args_list[0].kwargs == {"log_step": "consultazioni"}
+    assert open_consultations.await_args_list[1].kwargs == {
+        "log_step": "consultazioni_dopo_informativa"
+    }
+    confirm_privacy.assert_awaited_once_with(page, fake_logger)
+    page.locator.assert_called_once_with(utils._SISTER_VISURE_SERVICE_SELECTOR)
+    visure.click.assert_awaited_once_with(no_wait_after=True)
+    wait_entry.assert_awaited_once_with(page)
+    fake_logger.log.assert_awaited_once_with(page, "visure_catastali")
+
+
+def test_open_sister_visure_uses_direct_url_when_service_link_is_missing(monkeypatch):
+    page = MagicMock()
+    page.url = "https://sister3.agenziaentrate.gov.it/Servizi/index.jsp"
+    page.goto = AsyncMock()
+    logger = MagicMock()
+    logger.log = AsyncMock()
+    monkeypatch.setattr(
+        utils,
+        "_open_sister_consultations",
+        AsyncMock(return_value="missing"),
+    )
+    wait_entry = AsyncMock()
+    monkeypatch.setattr(utils, "_wait_for_sister_visure_entry", wait_entry)
+
+    asyncio.run(utils._open_sister_visure_from_services(page, logger))
+
+    page.goto.assert_awaited_once_with(
+        utils._SISTER_VISURE_INFORMATIVA_URL,
+        timeout=30000,
+        wait_until="domcontentloaded",
+    )
+    wait_entry.assert_awaited_once_with(page)
+    logger.log.assert_awaited_once_with(page, "visure_catastali_fallback")
 
 
 def test_direct_sister_login_already_inside_visure_skips_service_menu(monkeypatch):

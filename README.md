@@ -686,7 +686,7 @@ Il browser viene lanciato con `handle_sigint=False, handle_sigterm=False` per im
 5. Clicca "Autorizza" → **attende fino a 120 secondi** l'approvazione sull'app MySielteID
 6. Cerca "SISTER" tra i servizi → clicca "Vai al servizio"
 7. Verifica assenza di sessione bloccata ("Utente già in sessione")
-8. Naviga: Conferma → Consultazioni e Certificazioni → Visure catastali → Conferma Lettura
+8. Naviga: Conferma → Consultazioni e Certificazioni → Visure catastali → Conferma Lettura; attende il collegamento reale del servizio e usa il relativo URL interno come fallback se il menu tarda a popolarsi
 9. Se sono presenti più convenzioni, sceglie quella configurata
 10. Se `SISTER_OFFICE` è impostato, seleziona l'ufficio e lascia già pronto il modulo Immobile
 
