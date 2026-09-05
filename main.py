@@ -22,7 +22,7 @@ import time
 from contextlib import asynccontextmanager, suppress
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Dict, Optional
+from typing import Callable, Dict, Optional
 
 from cachetools import TTLCache
 from dotenv import load_dotenv
@@ -153,6 +153,58 @@ class VisuraResponse:
             self.timestamp = datetime.now()
 
 
+ProgressCallback = Callable[[int, str, str], None]
+
+
+@dataclass
+class SearchPageSlot:
+    """Scheda SISTER riutilizzabile all'interno della sessione autenticata."""
+
+    page: Page
+    preferred_tipo: str
+    busy: bool = False
+
+
+def _canonical_cadastral_identifier(value: object) -> str:
+    normalized = "".join(str(value or "").split()).casefold()
+    return normalized.lstrip("0") or ("0" if normalized else "")
+
+
+def _assert_result_identity(
+    result: object,
+    *,
+    foglio: str,
+    particella: str,
+    subalterno: Optional[str] = None,
+) -> None:
+    """Blocca un eventuale risultato appartenente a una ricerca concorrente."""
+    if not isinstance(result, dict):
+        return
+
+    rows = list(result.get("immobili") or [])
+    if isinstance(result.get("immobile"), dict):
+        rows.append(result["immobile"])
+
+    expected = {
+        "Foglio": _canonical_cadastral_identifier(foglio),
+        "Particella": _canonical_cadastral_identifier(particella),
+    }
+    if subalterno is not None:
+        expected["Sub"] = _canonical_cadastral_identifier(subalterno)
+
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        for field, expected_value in expected.items():
+            actual_value = _canonical_cadastral_identifier(row.get(field))
+            if actual_value and actual_value != expected_value:
+                raise BrowserError(
+                    "Risultato SISTER non coerente con la richiesta concorrente: "
+                    f"{field} atteso={expected_value}, ricevuto={actual_value}. "
+                    "Disabilitare SISTER_PARALLEL_TABS e riprovare."
+                )
+
+
 class BrowserManager:
     STATE_LOGGED_OUT = "logged_out"
     STATE_OPENING = "opening"
@@ -178,9 +230,143 @@ class BrowserManager:
         self.session_error: Optional[str] = None
         self.page_lock = asyncio.Lock()
         self.session_lock = asyncio.Lock()
+        self.search_slots: list[SearchPageSlot] = []
+        self.search_slots_condition = asyncio.Condition()
+        self.lifecycle_pending = False
+        self.active_page_operations = 0
+        self.parallel_tabs_error: Optional[str] = None
         # Stats per resource blocking (popolato in initialize → context.route)
         self.blocked_resources_count: int = 0
         self.blocked_resources_samples: list = []  # primi N URL bloccati per diagnostica
+
+    @staticmethod
+    def parallel_tabs_configured() -> bool:
+        """Restituisce True solo quando la sperimentazione e' abilitata."""
+        return os.getenv("SISTER_PARALLEL_TABS", "0") == "1"
+
+    async def _set_search_slots(self, slots: list[SearchPageSlot]) -> None:
+        async with self.search_slots_condition:
+            self.search_slots = slots
+            self.active_page_operations = sum(1 for slot in slots if slot.busy)
+            self.search_slots_condition.notify_all()
+
+    @asynccontextmanager
+    async def _exclusive_pages(self):
+        """Blocca nuove ricerche e attende quelle attive prima del lifecycle."""
+        async with self.page_lock:
+            async with self.search_slots_condition:
+                self.lifecycle_pending = True
+                await self.search_slots_condition.wait_for(
+                    lambda: not any(slot.busy for slot in self.search_slots)
+                )
+            try:
+                yield
+            finally:
+                async with self.search_slots_condition:
+                    self.lifecycle_pending = False
+                    self.search_slots_condition.notify_all()
+
+    @asynccontextmanager
+    async def _lease_search_page(self, tipo_catasto: str):
+        """Assegna una scheda libera, preferendo quella predisposta per T/F."""
+        async with self.search_slots_condition:
+            await self.search_slots_condition.wait_for(
+                lambda: (
+                    not self.lifecycle_pending
+                    and self.authenticated
+                    and any(not slot.busy for slot in self.search_slots)
+                )
+                or (
+                    not self.authenticated
+                    and self.session_state
+                    in {self.STATE_ERROR, self.STATE_LOCKED, self.STATE_LOGGED_OUT}
+                )
+            )
+            if not self.authenticated or not self.search_slots:
+                raise AuthenticationError(self.session_error or "Sessione SISTER non disponibile")
+
+            available = [slot for slot in self.search_slots if not slot.busy]
+            slot = next(
+                (candidate for candidate in available if candidate.preferred_tipo == tipo_catasto),
+                available[0],
+            )
+            slot.busy = True
+            self.active_page_operations += 1
+            self.session_state = self.STATE_BUSY
+
+        try:
+            yield slot.page
+        finally:
+            async with self.search_slots_condition:
+                slot.busy = False
+                self.active_page_operations = max(0, self.active_page_operations - 1)
+                if self.authenticated and self.session_state not in {
+                    self.STATE_OPENING,
+                    self.STATE_CLOSING,
+                    self.STATE_ERROR,
+                    self.STATE_LOCKED,
+                }:
+                    self.session_state = (
+                        self.STATE_BUSY if self.active_page_operations else self.STATE_READY
+                    )
+                self.search_slots_condition.notify_all()
+
+    async def _configure_search_tabs(self) -> None:
+        """Prepara una o due schede che condividono cookie e sessione SISTER."""
+        if not self.auth_page or self.auth_page.is_closed():
+            raise AuthenticationError("Pagina SISTER autenticata non disponibile")
+
+        self.parallel_tabs_error = None
+        primary = SearchPageSlot(page=self.auth_page, preferred_tipo="F")
+        await self._set_search_slots([primary])
+
+        if not self.parallel_tabs_configured():
+            return
+
+        secondary = None
+        try:
+            if not self.context:
+                raise RuntimeError("Browser context non disponibile")
+            secondary = await self.context.new_page()
+            logger.info("[PARALLEL] Apro seconda scheda nella sessione SISTER esistente")
+            await secondary.goto(
+                "https://sister3.agenziaentrate.gov.it/Visure/SceltaServizio.do?tipo=/T/TM/VCVC_",
+                timeout=60000,
+                wait_until="domcontentloaded",
+            )
+            tab_logger = PageLogger("parallel_tab")
+            await ensure_sister_visure_context(secondary, tab_logger)
+
+            sister_office = os.getenv("SISTER_OFFICE", "").strip()
+            if not sister_office:
+                raise RuntimeError("SISTER_OFFICE e' obbligatorio per predisporre due schede")
+            await prepare_sister_immobile_search(
+                secondary,
+                sister_office,
+                tab_logger,
+                label_prefix="parallel",
+            )
+
+            await self.auth_page.locator("select[name='tipoCatasto']").select_option("F")
+            await secondary.locator("select[name='tipoCatasto']").select_option("T")
+            await self._set_search_slots(
+                [
+                    SearchPageSlot(page=self.auth_page, preferred_tipo="F"),
+                    SearchPageSlot(page=secondary, preferred_tipo="T"),
+                ]
+            )
+            logger.info("[PARALLEL] Due schede SISTER pronte: Fabbricati e Terreni")
+        except Exception as exc:
+            self.parallel_tabs_error = str(exc)
+            logger.warning(
+                f"[PARALLEL] Seconda scheda non disponibile; continuo in modalita' seriale: {exc}"
+            )
+            if secondary and not secondary.is_closed():
+                try:
+                    await secondary.close()
+                except Exception:
+                    pass
+            await self._set_search_slots([primary])
 
     async def _install_resource_blocking(self) -> None:
         """Installa un route handler a livello context che blocca asset inutili.
@@ -242,6 +428,9 @@ class BrowserManager:
         try:
             if self.browser is not None and self.browser.is_connected() and self.context is not None:
                 return
+
+            await self._set_search_slots([])
+            self.parallel_tabs_error = None
 
             # Ferma un'eventuale istanza Playwright precedente per evitare
             # processi Chromium orfani al re-init (session recovery, restart).
@@ -325,6 +514,7 @@ class BrowserManager:
                 self.last_client_activity = self.last_login_time
                 self.last_sister_activity = self.last_login_time
                 self.selected_convention = selected_convention or os.getenv("SISTER_CONVENTION") or None
+                await self._configure_search_tabs()
                 logger.info(f"Login completato con successo al tentativo {attempt}")
                 return
             except PlaywrightTimeoutError as e:
@@ -371,6 +561,11 @@ class BrowserManager:
             "last_sister_activity": (self.last_sister_activity.isoformat() if self.last_sister_activity else None),
             "idle_timeout_seconds": int(os.getenv("SESSION_IDLE_TIMEOUT_SECONDS", "900")),
             "keepalive_seconds": int(os.getenv("SESSION_KEEPALIVE_SECONDS", "60")),
+            "parallel_tabs_configured": self.parallel_tabs_configured(),
+            "parallel_tabs_active": len(self.search_slots) > 1,
+            "parallel_tabs_count": len(self.search_slots),
+            "parallel_tabs_busy": self.active_page_operations,
+            "parallel_tabs_error": self.parallel_tabs_error,
             "error": self.session_error,
         }
 
@@ -391,7 +586,7 @@ class BrowserManager:
             self.session_state = self.STATE_OPENING
             self.session_error = None
             try:
-                async with self.page_lock:
+                async with self._exclusive_pages():
                     if self.browser is not None or self.context is not None or self.playwright is not None:
                         await self._logout_and_close_browser_unlocked(reason="reopen")
                     await self.initialize()
@@ -407,7 +602,7 @@ class BrowserManager:
                     if "gia' in sessione" in str(e).lower() or "già in sessione" in str(e).lower()
                     else self.STATE_ERROR
                 )
-                async with self.page_lock:
+                async with self._exclusive_pages():
                     await self._logout_and_close_browser_unlocked(reason="open_failed")
                 raise AuthenticationError(str(e)) from e
 
@@ -461,7 +656,7 @@ class BrowserManager:
 
     async def _perform_session_refresh(self):
         """Refresh approfondito della sessione navigando alla pagina di scelta servizio"""
-        async with self.page_lock:
+        async with self._exclusive_pages():
             if (
                 self.session_state != self.STATE_READY
                 or not self.authenticated
@@ -637,9 +832,18 @@ class BrowserManager:
 
     async def _ensure_authenticated(self):
         """Assicura che esista una sessione pronta senza creare login concorrenti."""
-        await self.open_session()
+        session = await self.open_session()
+        if session.get("session_state") == self.STATE_OPENING:
+            async with self.session_lock:
+                pass
+        if not self.authenticated or self.session_state not in {self.STATE_READY, self.STATE_BUSY}:
+            raise AuthenticationError(self.session_error or "Sessione SISTER non pronta")
 
-    async def esegui_visura(self, request: VisuraRequest) -> VisuraResponse:
+    async def esegui_visura(
+        self,
+        request: VisuraRequest,
+        progress: Optional[ProgressCallback] = None,
+    ) -> VisuraResponse:
         """Esegue una visura catastale (solo dati catastali, senza intestati).
 
         Se ``request.fallback_other_catasto`` e' True e il primo tentativo
@@ -648,30 +852,39 @@ class BrowserManager:
         ``tipo_catasto_used`` e ``fallback_used`` nel campo ``data``.
         """
         try:
+            if progress:
+                progress(15, "session", "Apertura del Catasto")
             await self._ensure_authenticated()
+            if progress:
+                progress(35, "ready", "Catasto pronto")
 
             async def _run(tipo: str):
-                async with self.page_lock:
-                    self.session_state = self.STATE_BUSY
-                    try:
-                        result = await run_visura(
-                            self.auth_page,
-                            request.provincia,
-                            request.comune,
-                            request.sezione,
-                            request.foglio,
-                            request.particella,
-                            tipo,
-                            extract_intestati=False,
-                            subalterno=request.subalterno,
-                            codice_belfiore=request.codice_belfiore,
-                        )
-                        self.last_sister_activity = datetime.now()
-                        self.mark_client_activity()
-                        return result
-                    finally:
-                        if self.authenticated:
-                            self.session_state = self.STATE_READY
+                async with self._lease_search_page(tipo) as search_page:
+                    if progress:
+                        progress(50, "search", "Ricerca catastale in corso")
+                    result = await run_visura(
+                        search_page,
+                        request.provincia,
+                        request.comune,
+                        request.sezione,
+                        request.foglio,
+                        request.particella,
+                        tipo,
+                        extract_intestati=False,
+                        subalterno=request.subalterno,
+                        codice_belfiore=request.codice_belfiore,
+                    )
+                    _assert_result_identity(
+                        result,
+                        foglio=request.foglio,
+                        particella=request.particella,
+                        subalterno=request.subalterno,
+                    )
+                    self.last_sister_activity = datetime.now()
+                    self.mark_client_activity()
+                    if progress:
+                        progress(90, "results", "Elaborazione dei risultati")
+                    return result
 
             try:
                 result = await _run(request.tipo_catasto)
@@ -739,42 +952,55 @@ class BrowserManager:
                 error=f"Errore inatteso: {str(e)}",
             )
 
-    async def esegui_visura_intestati(self, request: VisuraIntestatiRequest) -> VisuraResponse:
+    async def esegui_visura_intestati(
+        self,
+        request: VisuraIntestatiRequest,
+        progress: Optional[ProgressCallback] = None,
+    ) -> VisuraResponse:
         """Esegue una visura per ottenere gli intestati di un immobile specifico."""
         try:
+            if progress:
+                progress(15, "session", "Apertura del Catasto")
             await self._ensure_authenticated()
+            if progress:
+                progress(35, "ready", "Catasto pronto")
 
-            async with self.page_lock:
-                self.session_state = self.STATE_BUSY
-                try:
-                    if request.tipo_catasto == "F" and request.subalterno:
-                        result = await run_visura_immobile(
-                            self.auth_page,
-                            provincia=request.provincia,
-                            comune=request.comune,
-                            sezione=request.sezione,
-                            foglio=request.foglio,
-                            particella=request.particella,
-                            subalterno=request.subalterno,
-                            codice_belfiore=request.codice_belfiore,
-                        )
-                    else:
-                        result = await run_visura(
-                            self.auth_page,
-                            request.provincia,
-                            request.comune,
-                            request.sezione,
-                            request.foglio,
-                            request.particella,
-                            request.tipo_catasto,
-                            extract_intestati=True,
-                            codice_belfiore=request.codice_belfiore,
-                        )
-                    self.last_sister_activity = datetime.now()
-                    self.mark_client_activity()
-                finally:
-                    if self.authenticated:
-                        self.session_state = self.STATE_READY
+            async with self._lease_search_page(request.tipo_catasto) as search_page:
+                if progress:
+                    progress(50, "owners", "Ricerca degli intestatari")
+                if request.tipo_catasto == "F" and request.subalterno:
+                    result = await run_visura_immobile(
+                        search_page,
+                        provincia=request.provincia,
+                        comune=request.comune,
+                        sezione=request.sezione,
+                        foglio=request.foglio,
+                        particella=request.particella,
+                        subalterno=request.subalterno,
+                        codice_belfiore=request.codice_belfiore,
+                    )
+                else:
+                    result = await run_visura(
+                        search_page,
+                        request.provincia,
+                        request.comune,
+                        request.sezione,
+                        request.foglio,
+                        request.particella,
+                        request.tipo_catasto,
+                        extract_intestati=True,
+                        codice_belfiore=request.codice_belfiore,
+                    )
+                _assert_result_identity(
+                    result,
+                    foglio=request.foglio,
+                    particella=request.particella,
+                    subalterno=request.subalterno,
+                )
+                self.last_sister_activity = datetime.now()
+                self.mark_client_activity()
+                if progress:
+                    progress(90, "results", "Elaborazione degli intestatari")
 
             logger.info(f"Visura intestati completata per {request.request_id}")
             return VisuraResponse(
@@ -810,6 +1036,7 @@ class BrowserManager:
 
     async def _close_browser_unlocked(self):
         """Chiude le risorse locali. Il chiamante deve possedere ``page_lock``."""
+        await self._set_search_slots([])
         try:
             if self.context:
                 await self.context.close()
@@ -857,7 +1084,7 @@ class BrowserManager:
                     logger.info("Logout inattivita' annullato: nel frattempo e' arrivata una richiesta")
                     return self.status_snapshot()
             self.session_state = self.STATE_CLOSING
-            async with self.page_lock:
+            async with self._exclusive_pages():
                 await self._logout_and_close_browser_unlocked(reason=reason)
             self.session_state = self.STATE_LOGGED_OUT
             self.session_error = None
@@ -900,25 +1127,37 @@ class VisuraService:
         # TTLCache: ogni entry vive ``ttl_seconds`` poi viene rimossa; se la
         # cache supera ``maxsize`` evict LRU. Fix memory leak F5.
         self.response_store: TTLCache = TTLCache(maxsize=maxsize, ttl=ttl_seconds)
+        self.progress_store: TTLCache = TTLCache(maxsize=maxsize, ttl=ttl_seconds)
 
         self.processing = False
         self.worker_task: Optional[asyncio.Task] = None
+        self.worker_tasks: list[asyncio.Task] = []
         self.active_request_id: Optional[str] = None
+        self.active_request_ids: set[str] = set()
 
     async def initialize(self):
         """Avvia l'API senza aprire una sessione SISTER."""
         await self.browser_manager.start_keep_alive()
-        self.worker_task = asyncio.create_task(self._process_requests(), name="visura-request-worker")
+        worker_count = 2 if self.browser_manager.parallel_tabs_configured() else 1
+        self.worker_tasks = [
+            asyncio.create_task(
+                self._process_requests(worker_number),
+                name=f"visura-request-worker-{worker_number}",
+            )
+            for worker_number in range(1, worker_count + 1)
+        ]
+        self.worker_task = self.worker_tasks[0]
+        logger.info(f"Worker visure avviati: {worker_count}")
 
     async def open_session(self) -> dict:
         return await self.browser_manager.open_session()
 
     async def close_session(self) -> dict:
-        if self.active_request_id or self.request_queue.qsize():
+        if self.active_request_ids or self.active_request_id or self.request_queue.qsize():
             raise RuntimeError("Impossibile chiudere SISTER con richieste in lavorazione o in coda")
         return await self.browser_manager.close_session(reason="api_request")
 
-    async def _process_requests(self):
+    async def _process_requests(self, worker_number: int = 1):
         """Processa le richieste in coda"""
         self.processing = True
 
@@ -926,23 +1165,43 @@ class VisuraService:
             try:
                 request_data = await self.request_queue.get()
                 request = request_data["request"]
-                self.active_request_id = getattr(request, "request_id", None)
+                request_id = getattr(request, "request_id", None)
+                if request_id:
+                    self.active_request_ids.add(request_id)
+                self.active_request_id = sorted(self.active_request_ids)[0] if self.active_request_ids else None
+                logger.info(f"Worker {worker_number} elabora {request_id}")
+                if request_id:
+                    self._set_progress(request_id, 10, "starting", "Preparazione della richiesta")
 
                 try:
                     if isinstance(request, VisuraRequest):
-                        response = await self.browser_manager.esegui_visura(request)
+                        response = await self.browser_manager.esegui_visura(
+                            request,
+                            lambda percent, phase, message: self._set_progress(
+                                request.request_id, percent, phase, message
+                            ),
+                        )
                         self.response_store[request.request_id] = response
+                        self._finish_progress(request.request_id, response)
                         logger.info(f"Processata richiesta visura {request.request_id}")
 
                     elif isinstance(request, VisuraIntestatiRequest):
-                        response = await self.browser_manager.esegui_visura_intestati(request)
+                        response = await self.browser_manager.esegui_visura_intestati(
+                            request,
+                            lambda percent, phase, message: self._set_progress(
+                                request.request_id, percent, phase, message
+                            ),
+                        )
                         self.response_store[request.request_id] = response
+                        self._finish_progress(request.request_id, response)
                         logger.info(f"Processata richiesta intestati {request.request_id}")
 
                     else:
                         logger.error(f"Tipo di richiesta sconosciuto: {type(request)}")
                 finally:
-                    self.active_request_id = None
+                    if request_id:
+                        self.active_request_ids.discard(request_id)
+                    self.active_request_id = sorted(self.active_request_ids)[0] if self.active_request_ids else None
                     self.request_queue.task_done()
 
                 # Breve yield al loop per evitare burst su SISTER; il rate-limit
@@ -960,11 +1219,12 @@ class VisuraService:
         Solleva ``QueueFullError`` se la coda è piena (vedi
         ``MAX_QUEUE_SIZE`` env). Gli endpoint la traducono in HTTP 429.
         """
-        await self.open_session()
         try:
             self.request_queue.put_nowait({"request": request})
         except asyncio.QueueFull as e:
             raise QueueFullError(f"Coda piena (limite {self.request_queue.maxsize}): riprovare più tardi") from e
+        self.browser_manager.mark_client_activity()
+        self._set_progress(request.request_id, 5, "queued", "Richiesta in coda")
         logger.info(
             f"Richiesta visura {request.request_id} aggiunta alla coda (posizione: {self.request_queue.qsize()})"
         )
@@ -976,11 +1236,12 @@ class VisuraService:
         Solleva ``QueueFullError`` se la coda è piena (vedi
         ``MAX_QUEUE_SIZE`` env). Gli endpoint la traducono in HTTP 429.
         """
-        await self.open_session()
         try:
             self.request_queue.put_nowait({"request": request})
         except asyncio.QueueFull as e:
             raise QueueFullError(f"Coda piena (limite {self.request_queue.maxsize}): riprovare più tardi") from e
+        self.browser_manager.mark_client_activity()
+        self._set_progress(request.request_id, 5, "queued", "Richiesta in coda")
         logger.info(
             f"Richiesta intestati {request.request_id} aggiunta alla coda (posizione: {self.request_queue.qsize()})"
         )
@@ -989,6 +1250,38 @@ class VisuraService:
     async def get_response(self, request_id: str) -> Optional[VisuraResponse]:
         """Ottiene la risposta per un request_id"""
         return self.response_store.get(request_id)
+
+    def get_progress(self, request_id: str) -> dict:
+        """Restituisce l'ultimo avanzamento noto della richiesta."""
+        return dict(
+            self.progress_store.get(
+                request_id,
+                {
+                    "progress_percent": 0,
+                    "progress_phase": "unknown",
+                    "progress_message": "Richiesta in elaborazione",
+                },
+            )
+        )
+
+    def _set_progress(self, request_id: str, percent: int, phase: str, message: str) -> None:
+        previous = self.progress_store.get(request_id, {})
+        previous_percent = int(previous.get("progress_percent", 0))
+        self.progress_store[request_id] = {
+            "progress_percent": max(previous_percent, min(100, max(0, int(percent)))),
+            "progress_phase": str(phase),
+            "progress_message": str(message),
+        }
+
+    def _finish_progress(self, request_id: str, response: VisuraResponse) -> None:
+        self._set_progress(
+            request_id,
+            100,
+            "completed" if response.success else "error",
+            "Consultazione catastale completata"
+            if response.success
+            else "Consultazione catastale non riuscita",
+        )
 
     async def shutdown(self):
         """Chiude il servizio"""
@@ -1004,12 +1297,21 @@ class VisuraService:
 
     async def _stop_worker(self):
         self.processing = False
-        task = self.worker_task
+        tasks = list(self.worker_tasks)
+        if self.worker_task and self.worker_task not in tasks:
+            tasks.append(self.worker_task)
         self.worker_task = None
-        if task and task is not asyncio.current_task() and not task.done():
-            task.cancel()
-            with suppress(asyncio.CancelledError):
-                await task
+        self.worker_tasks = []
+        current = asyncio.current_task()
+        for task in tasks:
+            if task is not current and not task.done():
+                task.cancel()
+        for task in tasks:
+            if task is not current:
+                with suppress(asyncio.CancelledError):
+                    await task
+        self.active_request_ids.clear()
+        self.active_request_id = None
 
 
 # Global service instance - initialized during lifespan
@@ -1253,10 +1555,17 @@ async def ottieni_visura(
         response = await service.get_response(request_id)
 
         if response is None:
+            progress = service.get_progress(request_id)
             return JSONResponse(
-                {"request_id": request_id, "status": "processing", "message": "Richiesta in elaborazione"}
+                {
+                    "request_id": request_id,
+                    "status": "processing",
+                    "message": progress["progress_message"],
+                    **progress,
+                }
             )
 
+        progress = service.get_progress(request_id)
         return JSONResponse(
             {
                 "request_id": request_id,
@@ -1265,6 +1574,7 @@ async def ottieni_visura(
                 "data": response.data,
                 "error": response.error,
                 "timestamp": response.timestamp.isoformat(),
+                **progress,
             }
         )
 
@@ -1336,6 +1646,7 @@ async def health_check(service: VisuraService = Depends(get_visura_service)):
             **session,
             "queue_size": service.request_queue.qsize(),
             "active_request_id": service.active_request_id,
+            "active_request_ids": sorted(getattr(service, "active_request_ids", set())),
         }
     )
 
