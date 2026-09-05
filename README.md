@@ -52,16 +52,16 @@ Visura API permette di interrogare i dati catastali italiani tramite una semplic
 | **1 — Immobili** | `POST /visura` | Cerca gli immobili associati a foglio + particella |
 | **2 — Intestati** | `POST /visura/intestati` | Recupera i titolari di uno specifico subalterno |
 
-Entrambe le richieste vengono accodate ed eseguite sequenzialmente su un singolo browser autenticato al portale SISTER. I risultati si recuperano in polling con `GET /visura/{request_id}`.
+Entrambe le richieste vengono accodate su un singolo browser autenticato al portale SISTER. Il comportamento predefinito è seriale; la modalità sperimentale `SISTER_PARALLEL_TABS=1` usa due schede della stessa sessione. I risultati si recuperano in polling con `GET /visura/{request_id}`.
 
 ### Funzionalità principali
 
 - **Autenticazione SPID/SISTER automatizzata** — provider Sielte ID, PosteID o login diretto SISTER (selezionabile via `SPID_PROVIDER`)
-- **Coda sequenziale** — le richieste vengono processate una alla volta per non sovraccaricare il portale
+- **Concorrenza controllata** — una richiesta alla volta per default; opzionalmente due schede e due worker nella stessa sessione
 - **Sessione unica e lazy** — il browser SISTER viene aperto alla prima richiesta o tramite `POST /session/open`, mai in parallelo
 - **Convenzioni multiple** — selezione esplicita tramite `SISTER_CONVENTION`, senza scegliere automaticamente la prima convenzione
 - **Ufficio preselezionato** — con `SISTER_OFFICE` la sessione resta pronta sul modulo Immobile e riusa l'ufficio tra le richieste
-- **Keep-alive serializzato** — il rinnovo usa lo stesso lock delle visure e non può navigare mentre una richiesta è in corso
+- **Keep-alive coordinato** — il rinnovo attende che tutte le schede siano libere e blocca temporaneamente nuove ricerche
 - **Logout per inattività** — la sessione viene chiusa dopo un intervallo configurabile senza richieste del client
 - **Graceful shutdown** — su `SIGINT`/`SIGTERM` il servizio effettua il logout dal portale prima di chiudere il browser
 - **Logging HTML completo** — ogni pagina visitata dal browser viene salvata su disco per debug e audit
@@ -244,8 +244,14 @@ GET /health
   "session_state": "ready",
   "authenticated": true,
   "convention": "FONDAZIONE FOCI ASSOCIAZIONE DI PROMOZIONE SOCIALE (CONSULTAZIONI - PROFILO B)",
+  "parallel_tabs_configured": true,
+  "parallel_tabs_active": true,
+  "parallel_tabs_count": 2,
+  "parallel_tabs_busy": 0,
+  "parallel_tabs_error": null,
   "queue_size": 0,
-  "active_request_id": null
+  "active_request_id": null,
+  "active_request_ids": []
 }
 ```
 
@@ -279,7 +285,11 @@ dell'ufficio provinciale.
 POST /visura
 ```
 
-Cerca tutti gli immobili su una particella catastale. Se `tipo_catasto` è omesso, vengono accodate **due** richieste (Terreni + Fabbricati).
+Cerca tutti gli immobili su una particella catastale. Il `POST` risponde subito
+con gli identificativi: l'eventuale apertura della sessione e la consultazione
+avvengono nei worker, senza tenere bloccata la richiesta HTTP. Se
+`tipo_catasto` è omesso, vengono accodate **due** richieste (Terreni +
+Fabbricati).
 
 **Request body:**
 
@@ -378,6 +388,22 @@ GET /visura/{request_id}
 ```
 
 Recupera lo stato e i dati di una richiesta precedentemente accodata.
+
+Durante l'elaborazione la risposta include un avanzamento monotono:
+
+```json
+{
+  "request_id": "req_F_1709312400000",
+  "status": "processing",
+  "message": "Ricerca catastale in corso",
+  "progress_percent": 50,
+  "progress_phase": "search",
+  "progress_message": "Ricerca catastale in corso"
+}
+```
+
+`progress_percent` arriva a `100` sia sul completamento sia sull'errore; lo
+stato finale resta determinato dal campo `status`.
 
 | Status | Significato |
 |--------|-------------|
@@ -655,13 +681,16 @@ Il progetto non applica ancora un mascheramento automatico dei dati nei log HTML
 | **Session refresh** | 60 secondi | Naviga a `SceltaServizio.do`, riseleziona la convenzione se richiesta e verifica gli uffici |
 | **Logout inattività** | 15 minuti | Chiude browser e sessione se non arrivano richieste client |
 
-Tutte le navigazioni Playwright — visura, intestati, rinnovo e logout — usano
-un unico lock. Il monitor non può quindi interrompere una pagina mentre la
-coda sta elaborando una richiesta.
+Rinnovo, logout e riapertura acquisiscono un blocco esclusivo e attendono che
+tutte le schede siano libere. In modalità parallela ogni ricerca prende in uso
+una sola scheda; il monitor non può quindi interrompere una richiesta.
 
 ### Coda di elaborazione
 
-- Unica `asyncio.Queue` con worker sequenziale
+- Unica `asyncio.Queue`: un worker per default, due con `SISTER_PARALLEL_TABS=1`
+- Due schede al massimo nello stesso `BrowserContext` e nella stessa sessione SISTER
+- Affinità Terreni/Fabbricati; una scheda libera può elaborare anche un secondo subalterno Fabbricati
+- Verifica foglio/particella/sub per bloccare eventuali risultati incrociati
 - Pausa di **0,1 secondi** tra una richiesta e l'altra
 - Pausa di **5 secondi** dopo un errore
 - I risultati restano in memoria (`response_store`) fino al riavvio del servizio
