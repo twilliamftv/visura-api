@@ -75,6 +75,15 @@ class FakeService:
     async def get_response(self, request_id):
         return self.responses.get(request_id)
 
+    def get_progress(self, request_id):
+        return {
+            "progress_percent": 100 if request_id in self.responses else 25,
+            "progress_phase": "completed" if request_id in self.responses else "search",
+            "progress_message": "Consultazione catastale completata"
+            if request_id in self.responses
+            else "Ricerca catastale in corso",
+        }
+
     async def graceful_shutdown(self):
         return None
 
@@ -118,7 +127,10 @@ def test_ottieni_visura_returns_processing_when_result_not_ready():
     assert payload == {
         "request_id": "req_1",
         "status": "processing",
-        "message": "Richiesta in elaborazione",
+        "message": "Ricerca catastale in corso",
+        "progress_percent": 25,
+        "progress_phase": "search",
+        "progress_message": "Ricerca catastale in corso",
     }
 
 
@@ -321,6 +333,21 @@ def test_ottieni_visura_returns_error_status_when_response_unsuccessful():
 
     assert payload["status"] == "error"
     assert payload["error"] == "boom"
+    assert payload["progress_percent"] == 100
+
+
+def test_ottieni_visura_returns_real_progress_while_processing():
+    response = asyncio.run(ottieni_visura("req_1", FakeService()))
+    payload = json.loads(response.body)
+
+    assert payload == {
+        "request_id": "req_1",
+        "status": "processing",
+        "message": "Ricerca catastale in corso",
+        "progress_percent": 25,
+        "progress_phase": "search",
+        "progress_message": "Ricerca catastale in corso",
+    }
 
 
 def test_richiedi_visura_wraps_unexpected_exception_as_http_500():
@@ -455,6 +482,9 @@ def test_visura_response_sets_timestamp_automatically():
 
 def test_visura_service_add_request_and_get_response_with_real_queue(monkeypatch):
     class DummyBrowserManager:
+        def mark_client_activity(self):
+            return None
+
         async def open_session(self):
             return {"session_state": "ready", "authenticated": True}
 
@@ -512,10 +542,16 @@ def test_visura_service_shutdown_and_graceful_shutdown_toggle_processing(monkeyp
 
 
 def test_service_initialize_starts_monitor_without_opening_sister(monkeypatch):
+    monkeypatch.delenv("SISTER_PARALLEL_TABS", raising=False)
+
     class DummyBrowserManager:
         def __init__(self):
             self.monitor_started = 0
             self.opened = 0
+
+        @staticmethod
+        def parallel_tabs_configured():
+            return False
 
         async def start_keep_alive(self):
             self.monitor_started += 1
@@ -530,6 +566,28 @@ def test_service_initialize_starts_monitor_without_opening_sister(monkeypatch):
         await service.initialize()
         assert service.browser_manager.monitor_started == 1
         assert service.browser_manager.opened == 0
+        await service._stop_worker()
+
+    asyncio.run(scenario())
+
+
+def test_service_parallel_mode_starts_two_workers(monkeypatch):
+    monkeypatch.setenv("SISTER_PARALLEL_TABS", "1")
+
+    class DummyBrowserManager:
+        async def start_keep_alive(self):
+            return None
+
+        @staticmethod
+        def parallel_tabs_configured():
+            return True
+
+    monkeypatch.setattr(main, "BrowserManager", DummyBrowserManager)
+
+    async def scenario():
+        service = VisuraService()
+        await service.initialize()
+        assert len(service.worker_tasks) == 2
         await service._stop_worker()
 
     asyncio.run(scenario())
@@ -616,6 +674,127 @@ def test_session_refresh_waits_for_page_lock():
         assert called.is_set()
 
     asyncio.run(scenario())
+
+
+def test_parallel_tabs_share_context_and_prepare_two_search_pages(monkeypatch):
+    monkeypatch.setenv("SISTER_PARALLEL_TABS", "1")
+    monkeypatch.setenv("SISTER_OFFICE", "Isernia")
+
+    def fake_page():
+        page = MagicMock()
+        page.is_closed.return_value = False
+        page.goto = AsyncMock()
+        page.close = AsyncMock()
+        locator = MagicMock()
+        locator.select_option = AsyncMock()
+        page.locator.return_value = locator
+        return page
+
+    primary = fake_page()
+    secondary = fake_page()
+    context = MagicMock()
+    context.new_page = AsyncMock(return_value=secondary)
+
+    ensure_context = AsyncMock(return_value="FONDAZIONE FOCI")
+    prepare = AsyncMock(return_value="ISERNIA Territorio-IS")
+    monkeypatch.setattr(main, "ensure_sister_visure_context", ensure_context)
+    monkeypatch.setattr(main, "prepare_sister_immobile_search", prepare)
+    monkeypatch.setattr(main, "PageLogger", lambda _flow: object())
+
+    manager = main.BrowserManager()
+    manager.auth_page = primary
+    manager.context = context
+
+    asyncio.run(manager._configure_search_tabs())
+
+    assert context.new_page.await_count == 1
+    assert [slot.page for slot in manager.search_slots] == [primary, secondary]
+    assert [slot.preferred_tipo for slot in manager.search_slots] == ["F", "T"]
+    assert manager.parallel_tabs_error is None
+    ensure_context.assert_awaited_once()
+    prepare.assert_awaited_once()
+
+
+def test_parallel_tabs_fall_back_to_serial_when_second_tab_fails(monkeypatch):
+    monkeypatch.setenv("SISTER_PARALLEL_TABS", "1")
+    monkeypatch.setenv("SISTER_OFFICE", "Isernia")
+
+    primary = MagicMock()
+    primary.is_closed.return_value = False
+    secondary = MagicMock()
+    secondary.is_closed.return_value = False
+    secondary.goto = AsyncMock(side_effect=RuntimeError("SISTER rifiuta la scheda"))
+    secondary.close = AsyncMock()
+    context = MagicMock()
+    context.new_page = AsyncMock(return_value=secondary)
+
+    manager = main.BrowserManager()
+    manager.auth_page = primary
+    manager.context = context
+
+    asyncio.run(manager._configure_search_tabs())
+
+    assert len(manager.search_slots) == 1
+    assert manager.search_slots[0].page is primary
+    assert "rifiuta" in manager.parallel_tabs_error
+    secondary.close.assert_awaited_once()
+
+
+def test_two_fabbricati_or_subalterni_can_lease_both_tabs():
+    async def scenario():
+        manager = main.BrowserManager()
+        first_page = object()
+        second_page = object()
+        manager.authenticated = True
+        manager.session_state = manager.STATE_READY
+        manager.search_slots = [
+            main.SearchPageSlot(first_page, "F"),
+            main.SearchPageSlot(second_page, "T"),
+        ]
+
+        entered = []
+        both_entered = asyncio.Event()
+        release = asyncio.Event()
+
+        async def use_fabbricati_tab():
+            async with manager._lease_search_page("F") as page:
+                entered.append(page)
+                if len(entered) == 2:
+                    both_entered.set()
+                await release.wait()
+
+        tasks = [
+            asyncio.create_task(use_fabbricati_tab()),
+            asyncio.create_task(use_fabbricati_tab()),
+        ]
+        await asyncio.wait_for(both_entered.wait(), timeout=0.2)
+        assert set(entered) == {first_page, second_page}
+        assert manager.active_page_operations == 2
+        assert manager.session_state == manager.STATE_BUSY
+
+        release.set()
+        await asyncio.gather(*tasks)
+        assert manager.active_page_operations == 0
+        assert manager.session_state == manager.STATE_READY
+
+    asyncio.run(scenario())
+
+
+def test_parallel_result_identity_guard_accepts_zero_padding_and_rejects_cross_result():
+    main._assert_result_identity(
+        {"immobili": [{"Foglio": "0011", "Particella": "000786", "Sub": "01"}]},
+        foglio="11",
+        particella="786",
+        subalterno="1",
+    )
+
+    with pytest.raises(main.BrowserError, match="non coerente"):
+        main._assert_result_identity(
+            {"immobile": {"Foglio": "11", "Particella": "786", "Sub": "2"}},
+            foglio="11",
+            particella="786",
+            subalterno="1",
+        )
 
 
 def test_session_refresh_restores_configured_office_search_form(monkeypatch):
@@ -816,10 +995,6 @@ def test_add_request_raises_queue_full_when_full(monkeypatch):
     monkeypatch.setenv("MAX_QUEUE_SIZE", "1")
     service = VisuraService()
 
-    async def fake_open_session():
-        return {"session_state": "ready", "authenticated": True}
-
-    service.open_session = fake_open_session
     req1 = VisuraRequest(
         request_id="r1",
         tipo_catasto="T",
@@ -843,6 +1018,49 @@ def test_add_request_raises_queue_full_when_full(monkeypatch):
     asyncio.run(service.add_request(req1))
     with pytest.raises(main.QueueFullError):
         asyncio.run(service.add_request(req2))
+
+
+def test_add_request_enqueues_immediately_without_blocking_on_session_open(monkeypatch):
+    monkeypatch.setenv("MAX_QUEUE_SIZE", "2")
+    service = VisuraService()
+    service.open_session = AsyncMock(side_effect=AssertionError("non deve aprire la sessione nel POST"))
+    request = VisuraRequest(
+        request_id="req_fast",
+        tipo_catasto="F",
+        provincia="Isernia",
+        comune="Cerro al Volturno",
+        foglio="11",
+        particella="786",
+    )
+
+    request_id = asyncio.run(service.add_request(request))
+
+    assert request_id == "req_fast"
+    service.open_session.assert_not_awaited()
+    assert service.request_queue.qsize() == 1
+    assert service.get_progress("req_fast") == {
+        "progress_percent": 5,
+        "progress_phase": "queued",
+        "progress_message": "Richiesta in coda",
+    }
+
+
+def test_progress_is_monotonic_and_finishes_at_one_hundred(monkeypatch):
+    monkeypatch.setenv("MAX_QUEUE_SIZE", "2")
+    service = VisuraService()
+    service._set_progress("req_1", 50, "search", "Ricerca")
+    service._set_progress("req_1", 35, "ready", "Pronto")
+    assert service.get_progress("req_1")["progress_percent"] == 50
+
+    service._finish_progress(
+        "req_1",
+        VisuraResponse(request_id="req_1", success=True, tipo_catasto="F"),
+    )
+    assert service.get_progress("req_1") == {
+        "progress_percent": 100,
+        "progress_phase": "completed",
+        "progress_message": "Consultazione catastale completata",
+    }
 
 
 def test_richiedi_visura_returns_429_when_queue_full():
@@ -1012,6 +1230,7 @@ def test_esegui_visura_falls_back_to_other_catasto_when_not_found(monkeypatch):
     bm = main.BrowserManager()
     bm.authenticated = True
     bm.auth_page = object()
+    bm.search_slots = [main.SearchPageSlot(bm.auth_page, "T")]
 
     async def _noop():
         return None
@@ -1057,6 +1276,7 @@ def test_esegui_visura_no_fallback_when_disabled(monkeypatch):
     bm = main.BrowserManager()
     bm.authenticated = True
     bm.auth_page = object()
+    bm.search_slots = [main.SearchPageSlot(bm.auth_page, "T")]
 
     async def _noop():
         return None
@@ -1092,6 +1312,7 @@ def test_esegui_visura_no_fallback_when_first_succeeds(monkeypatch):
     bm = main.BrowserManager()
     bm.authenticated = True
     bm.auth_page = object()
+    bm.search_slots = [main.SearchPageSlot(bm.auth_page, "T")]
 
     async def _noop():
         return None
