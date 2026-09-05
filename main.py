@@ -39,6 +39,7 @@ from utils import (
     extract_all_sezioni,
     login,
     logout,
+    prepare_sister_immobile_search,
     run_visura,
     run_visura_immobile,
 )
@@ -483,10 +484,24 @@ class BrowserManager:
             logger.info("Eseguendo refresh della sessione...")
 
             await self.auth_page.goto(
-                "https://sister3.agenziaentrate.gov.it/Visure/SceltaServizio.do?tipo=/T/TM/VCVC_", timeout=30000
+                "https://sister3.agenziaentrate.gov.it/Visure/SceltaServizio.do?tipo=/T/TM/VCVC_",
+                timeout=30000,
+                wait_until="domcontentloaded",
             )
-            await self.auth_page.wait_for_load_state("domcontentloaded", timeout=15000)
-            await ensure_sister_visure_context(self.auth_page, PageLogger("session_refresh"))
+            refresh_logger = PageLogger("session_refresh")
+            await ensure_sister_visure_context(self.auth_page, refresh_logger)
+
+            sister_office = os.getenv("SISTER_OFFICE", "").strip()
+            if sister_office:
+                await prepare_sister_immobile_search(
+                    self.auth_page,
+                    sister_office,
+                    refresh_logger,
+                    label_prefix="refresh",
+                )
+                self.last_sister_activity = datetime.now()
+                logger.info(f"Session refresh completato; modulo Immobile pronto per {sister_office}")
+                return True
 
             try:
                 provincia_options = await self.auth_page.locator("select[name='listacom'] option").count()

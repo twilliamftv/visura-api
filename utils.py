@@ -620,6 +620,20 @@ async def login(page: Page):
 
         step = "contesto_visure"
         selected_convention = await ensure_sister_visure_context(page, logger)
+
+        # Se l'installazione lavora sempre sullo stesso ufficio, prepariamo
+        # subito il modulo Immobile. La prima visura non dovra' quindi ripetere
+        # selezione provincia -> Applica -> Immobile.
+        sister_office = os.getenv("SISTER_OFFICE", "").strip()
+        if sister_office:
+            step = "preselezione_ufficio"
+            print(f"[LOGIN] Preseleziono l'ufficio SISTER: {sister_office}")
+            await prepare_sister_immobile_search(
+                page,
+                sister_office,
+                logger,
+                label_prefix="login",
+            )
         return selected_convention
 
     except Exception:
@@ -868,6 +882,7 @@ def _normalize_for_match(value: str) -> str:
 #     per forzare un refetch alla richiesta successiva.
 
 _DROPDOWN_CACHE: dict = {}
+_ACTIVE_SISTER_OFFICE: dict = {"name_norm": None, "value": None}
 
 
 async def _wait_for_ready(page, selector: str, timeout_ms: int = 15000, label: str = "") -> None:
@@ -911,6 +926,8 @@ def invalidate_dropdown_cache(reason: str = "") -> None:
     """
     n = len(_DROPDOWN_CACHE)
     _DROPDOWN_CACHE.clear()
+    _ACTIVE_SISTER_OFFICE["name_norm"] = None
+    _ACTIVE_SISTER_OFFICE["value"] = None
     print(f"[CACHE] invalidate cleared={n} reason={reason or 'unspecified'}")
 
 
@@ -1202,6 +1219,134 @@ async def find_best_option_match(page, selector, search_text, provincia_value: O
         return None
 
 
+async def prepare_sister_immobile_search(
+    page: Page,
+    provincia: str,
+    page_logger: PageLogger,
+    *,
+    label_prefix: str = "visura",
+) -> str:
+    """Porta la pagina al modulo di ricerca Immobile per ``provincia``.
+
+    Riusa l'ufficio gia' attivo quando possibile. Se il modulo Immobile e'
+    gia' presente ritorna subito; se la pagina espone gia' il link Immobile lo
+    clicca senza tornare alla scelta dell'ufficio. Solo in assenza di entrambi
+    esegue il percorso completo.
+
+    Le attese sono legate agli elementi necessari al passo successivo, non al
+    caricamento completo della pagina. Un percorso rapido non riuscito ricade
+    automaticamente sul percorso completo.
+    """
+    target_norm = _normalize_for_match(provincia)
+    if not target_norm:
+        raise ValueError("La provincia/ufficio SISTER non puo' essere vuota")
+
+    form_selector = "select[name='denomComune']"
+    office_selector = "select[name='listacom']"
+    immobile_selector = "a:has-text('Immobile'), [role='link']:has-text('Immobile')"
+    active_matches = _ACTIVE_SISTER_OFFICE.get("name_norm") == target_norm
+
+    if active_matches and await page.locator(form_selector).count() > 0:
+        print(f"[FAST] Modulo Immobile gia' pronto per l'ufficio {provincia}")
+        return str(_ACTIVE_SISTER_OFFICE.get("value") or provincia)
+
+    if active_matches:
+        immobile_link = page.get_by_role("link", name="Immobile")
+        if await immobile_link.count() > 0:
+            try:
+                print(f"[FAST] Riutilizzo l'ufficio {provincia}; clicco subito Immobile")
+                await immobile_link.first.click(no_wait_after=True)
+                await _wait_for_ready(
+                    page,
+                    form_selector,
+                    timeout_ms=10000,
+                    label=f"{label_prefix}_fast_immobile",
+                )
+                await page_logger.log(page, "immobile_riutilizzato")
+                return str(_ACTIVE_SISTER_OFFICE.get("value") or provincia)
+            except Exception as exc:
+                print(f"[FAST] Percorso rapido non riuscito ({exc}); uso il percorso completo")
+
+    office_select = page.locator(office_selector)
+    if await office_select.count() == 0:
+        print(f"[{label_prefix.upper()}] Navigando alla pagina di scelta servizio...")
+        await page.goto(
+            "https://sister3.agenziaentrate.gov.it/Visure/SceltaServizio.do?tipo=/T/TM/VCVC_",
+            timeout=60000,
+            wait_until="domcontentloaded",
+        )
+        await ensure_sister_visure_context(page, page_logger)
+        await _wait_for_ready(
+            page,
+            office_selector,
+            label=f"{label_prefix}_scelta_servizio",
+        )
+        office_select = page.locator(office_selector)
+        await page_logger.log(page, "scelta_servizio")
+
+    office_options_count = await page.locator(f"{office_selector} option").count()
+    if office_options_count <= 1:
+        raise RuntimeError("Uffici provinciali non disponibili: la sessione SISTER potrebbe essere scaduta")
+
+    office_items = await _collect_options_fast(page, office_selector)
+    available_offices = _format_options_for_debug(office_items)
+    office_value = await find_best_option_match(page, office_selector, provincia)
+    if not office_value:
+        raise RuntimeError(
+            f"Ufficio provinciale '{provincia}' non trovato. "
+            f"Primi 10 uffici disponibili: {', '.join(available_offices[:10])}"
+        )
+
+    print(f"[{label_prefix.upper()}] Seleziono ufficio: {office_value}")
+    await office_select.select_option(office_value)
+
+    apply_button = page.locator("input[type='submit'][value='Applica']")
+    print(f"[{label_prefix.upper()}] Clicco Applica...")
+    await apply_button.click(no_wait_after=True)
+    await _wait_for_ready(
+        page,
+        immobile_selector,
+        label=f"{label_prefix}_post_applica",
+    )
+    await page_logger.log(page, "provincia_applicata")
+
+    immobile_link = page.get_by_role("link", name="Immobile")
+    print(f"[{label_prefix.upper()}] Clicco Immobile appena disponibile...")
+    await immobile_link.first.click(no_wait_after=True)
+    await _wait_for_ready(
+        page,
+        form_selector,
+        label=f"{label_prefix}_post_immobile",
+    )
+    await page_logger.log(page, "immobile")
+
+    _ACTIVE_SISTER_OFFICE["name_norm"] = target_norm
+    _ACTIVE_SISTER_OFFICE["value"] = office_value
+    print(f"[{label_prefix.upper()}] Modulo Immobile pronto per {provincia}")
+    return office_value
+
+
+async def _wait_for_visura_search_outcome(page: Page, *, allow_subalterno_confirmation: bool = True) -> None:
+    """Attende il primo esito utile della ricerca senza aspettare il page load."""
+    await page.wait_for_function(
+        """
+        allowConfirmation => {
+          const text = document.body ? document.body.innerText : '';
+          const confirmation = allowConfirmation
+            && document.querySelector("input[name='confAssSub'][value='Conferma']");
+          return Boolean(
+            confirmation
+            || document.querySelector('table.listaIsp4')
+            || document.querySelector("input[name='intestati']")
+            || text.includes('NESSUNA CORRISPONDENZA TROVATA')
+          );
+        }
+        """,
+        allow_subalterno_confirmation,
+        timeout=30000,
+    )
+
+
 async def run_visura(
     page,
     provincia="Trieste",
@@ -1232,81 +1377,13 @@ async def run_visura(
     # Non creare una nuova pagina, usa quella esistente
     print("[VISURA] Utilizzando pagina di autenticazione esistente")
 
-    # STEP 1: Selezione Ufficio Provinciale
-    print("[VISURA] Navigando alla pagina di scelta servizio...")
-    await page.goto("https://sister3.agenziaentrate.gov.it/Visure/SceltaServizio.do?tipo=/T/TM/VCVC_", timeout=60000)
-    await page.wait_for_load_state("domcontentloaded", timeout=30000)
-    await ensure_sister_visure_context(page, logger)
-    await _wait_for_ready(page, "select[name='listacom']", label="visura_scelta_servizio")
-    print("[VISURA] Pagina caricata")
-    await logger.log(page, "scelta_servizio")
-
-    # Verifica che siamo realmente nella pagina di scelta servizio
-    current_url = page.url
-    if "SceltaServizio.do" not in current_url and "SelezioneConvenzione.do" not in current_url:
-        raise Exception(
-            f"La sessione sembra essere scaduta o si è verificato un errore durante il caricamento della pagina - URL: {current_url}"
-        )
-
-    # Verifica che le province siano disponibili
-    provincia_options_count = await page.locator("select[name='listacom'] option").count()
-    if provincia_options_count <= 1:
-        raise Exception(
-            "La sessione sembra essere scaduta o si è verificato un errore durante il caricamento della pagina"
-        )
-
-    # Verifica che la pagina sia stata caricata correttamente
-    content = await page.content()
-    if "error" in content.lower() or "sessione scaduta" in content.lower() or "login" in content.lower():
-        raise Exception(
-            "La sessione sembra essere scaduta o si è verificato un errore durante il caricamento della pagina"
-        )
-
-    # Trova e seleziona la provincia corretta
-    print(f"[VISURA] Cercando provincia: {provincia}")
-
-    # Prima estrai tutte le province disponibili per debug (single evaluate via helper)
-    _prov_items = await _collect_options_fast(page, "select[name='listacom']")
-    available_provinces = _format_options_for_debug(_prov_items)
-
-    # Se non ci sono province disponibili, probabilmente la sessione è scaduta
-    if len(available_provinces) == 0:
-        raise Exception("Nessuna provincia disponibile - la sessione potrebbe essere scaduta")
-
-    print(
-        f"[VISURA] Province disponibili: {', '.join(available_provinces[:10])}{'...' if len(available_provinces) > 10 else ''}"
-    )
-
-    provincia_value = await find_best_option_match(page, "select[name='listacom']", provincia)
-
-    if not provincia_value:
-        raise Exception(
-            f"Provincia '{provincia}' non trovata nelle opzioni disponibili. Prime 10 province disponibili: {', '.join(available_provinces[:10])}"
-        )
-
-    print(f"[VISURA] Selezionando provincia: {provincia_value}")
-    try:
-        await page.locator("select[name='listacom']").select_option(provincia_value)
-        print("[VISURA] Provincia selezionata")
-    except Exception as e:
-        raise Exception(f"Errore nella selezione della provincia '{provincia_value}': {e}")
-
-    print("[VISURA] Cliccando Applica...")
-    await page.locator("input[type='submit'][value='Applica']").click()
-    await _wait_for_ready(
+    # STEP 1-2: riusa l'ufficio gia' selezionato oppure prepara il modulo.
+    provincia_value = await prepare_sister_immobile_search(
         page,
-        "a:has-text('Immobile'), [role='link']:has-text('Immobile')",
-        label="visura_post_applica",
+        provincia,
+        logger,
+        label_prefix="visura",
     )
-    print("[VISURA] Applica cliccato, pagina caricata")
-    await logger.log(page, "provincia_applicata")
-
-    # STEP 2: Ricerca per immobili
-    print("[VISURA] Cliccando link Immobile...")
-    await page.get_by_role("link", name="Immobile").click()
-    await _wait_for_ready(page, "select[name='denomComune']", label="visura_post_immobile")
-    print("[VISURA] Link Immobile cliccato")
-    await logger.log(page, "immobile")
 
     # STEP 2.1: Seleziona tipo catasto (T=Terreni, F=Fabbricati)
     print(f"[VISURA] Selezionando tipo catasto: {tipo_catasto} ({'Terreni' if tipo_catasto == 'T' else 'Fabbricati'})")
@@ -1424,8 +1501,8 @@ async def run_visura(
 
     # Clicca Ricerca
     print("[VISURA] Cliccando Ricerca...")
-    await page.locator("input[name='scelta'][value='Ricerca']").click()
-    await page.wait_for_load_state("domcontentloaded", timeout=30000)
+    await page.locator("input[name='scelta'][value='Ricerca']").click(no_wait_after=True)
+    await _wait_for_visura_search_outcome(page)
     print("[VISURA] Ricerca cliccata")
     await logger.log(page, "ricerca")
 
@@ -1435,8 +1512,8 @@ async def run_visura(
         conferma_button = page.locator("input[name='confAssSub'][value='Conferma']")
         if await conferma_button.count() > 0:
             print("[VISURA] Rilevata richiesta conferma assenza subalterno...")
-            await conferma_button.click()
-            await page.wait_for_load_state("domcontentloaded", timeout=30000)
+            await conferma_button.click(no_wait_after=True)
+            await _wait_for_visura_search_outcome(page, allow_subalterno_confirmation=False)
             print("[VISURA] Conferma assenza subalterno cliccata")
             await logger.log(page, "conferma_subalterno")
     except Exception as e:
@@ -1918,43 +1995,13 @@ async def run_visura_immobile(
     if unsupported_reason:
         raise Exception(unsupported_reason)
 
-    # STEP 1: Selezione Ufficio Provinciale
-    print("[VISURA_IMMOBILE] Navigando alla pagina di scelta servizio...")
-    await page.goto("https://sister3.agenziaentrate.gov.it/Visure/SceltaServizio.do?tipo=/T/TM/VCVC_", timeout=60000)
-    await page.wait_for_load_state("domcontentloaded", timeout=30000)
-    await ensure_sister_visure_context(page, logger)
-    await _wait_for_ready(page, "select[name='listacom']", label="immobile_scelta_servizio")
-    print("[VISURA_IMMOBILE] Pagina caricata")
-    await logger.log(page, "scelta_servizio")
-
-    # Verifica che siamo realmente nella pagina di scelta servizio
-    current_url = page.url
-    if "SceltaServizio.do" not in current_url and "SelezioneConvenzione.do" not in current_url:
-        raise Exception(f"La sessione sembra essere scaduta o si è verificato un errore - URL: {current_url}")
-
-    # Trova e seleziona la provincia corretta
-    print(f"[VISURA_IMMOBILE] Cercando provincia: {provincia}")
-    provincia_value = await find_best_option_match(page, "select[name='listacom']", provincia)
-
-    if not provincia_value:
-        raise Exception(f"Provincia '{provincia}' non trovata nelle opzioni disponibili")
-
-    print(f"[VISURA_IMMOBILE] Selezionando provincia: {provincia_value}")
-    await page.locator("select[name='listacom']").select_option(provincia_value)
-    print("[VISURA_IMMOBILE] Cliccando Applica...")
-    await page.locator("input[type='submit'][value='Applica']").click()
-    await _wait_for_ready(
+    # STEP 1-2: riusa l'ufficio gia' selezionato oppure prepara il modulo.
+    provincia_value = await prepare_sister_immobile_search(
         page,
-        "a:has-text('Immobile'), [role='link']:has-text('Immobile')",
-        label="immobile_post_applica",
+        provincia,
+        logger,
+        label_prefix="immobile",
     )
-    await logger.log(page, "provincia_applicata")
-
-    # STEP 2: Ricerca per immobili
-    print("[VISURA_IMMOBILE] Cliccando link Immobile...")
-    await page.get_by_role("link", name="Immobile").click()
-    await _wait_for_ready(page, "select[name='denomComune']", label="immobile_post_immobile")
-    await logger.log(page, "immobile")
 
     # STEP 2.1: Seleziona tipo catasto FABBRICATI (F)
     print("[VISURA_IMMOBILE] Selezionando tipo catasto: F (Fabbricati)")
@@ -2031,8 +2078,8 @@ async def run_visura_immobile(
 
     # Clicca Ricerca
     print("[VISURA_IMMOBILE] Cliccando Ricerca...")
-    await page.locator("input[name='scelta'][value='Ricerca']").click()
-    await page.wait_for_load_state("domcontentloaded", timeout=30000)
+    await page.locator("input[name='scelta'][value='Ricerca']").click(no_wait_after=True)
+    await _wait_for_visura_search_outcome(page)
     await logger.log(page, "ricerca")
 
     # STEP 3: Gestisci conferma assenza subalterno (se necessario)
@@ -2040,8 +2087,8 @@ async def run_visura_immobile(
         conferma_button = page.locator("input[name='confAssSub'][value='Conferma']")
         if await conferma_button.count() > 0:
             print("[VISURA_IMMOBILE] Rilevata richiesta conferma assenza subalterno...")
-            await conferma_button.click()
-            await page.wait_for_load_state("domcontentloaded", timeout=30000)
+            await conferma_button.click(no_wait_after=True)
+            await _wait_for_visura_search_outcome(page, allow_subalterno_confirmation=False)
             await logger.log(page, "conferma_subalterno")
     except Exception as e:
         print(f"[VISURA_IMMOBILE] Errore o non necessaria conferma subalterno: {e}")
