@@ -601,7 +601,7 @@ def test_wait_for_visura_search_outcome_uses_dom_markers():
     assert "confAssSub" in script
     assert "table.listaIsp4" in script
     assert "NESSUNA CORRISPONDENZA TROVATA" in script
-    assert page.wait_for_function.await_args.args[1] is True
+    assert page.wait_for_function.await_args.kwargs["arg"] is True
     assert page.wait_for_function.await_args.kwargs["timeout"] == 30000
 
 
