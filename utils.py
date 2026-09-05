@@ -1439,7 +1439,7 @@ async def _wait_for_visura_search_outcome(page: Page, *, allow_subalterno_confir
           );
         }
         """,
-        allow_subalterno_confirmation,
+        arg=allow_subalterno_confirmation,
         timeout=30000,
     )
 
