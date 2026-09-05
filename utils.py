@@ -463,6 +463,69 @@ async def ensure_sister_visure_context(page: Page, logger: PageLogger) -> Option
     return selected
 
 
+_SISTER_CONSULTATIONS_URL = (
+    "https://sister3.agenziaentrate.gov.it/Servizi/SceltaServizio.do?"
+    "area=Consultazioni%20e%20Certificazioni"
+)
+_SISTER_VISURE_INFORMATIVA_URL = (
+    "https://sister3.agenziaentrate.gov.it/Visure/Informativa.do?tipo=/T/TM/VCVC_"
+)
+_SISTER_SERVICES_PRIVACY_SELECTOR = 'form input[type="submit"][name="submit"][value="Conferma"]'
+_SISTER_VISURE_SERVICE_SELECTOR = 'a[href*="/Visure/"][href*="VCVC_"]'
+_SISTER_VISURE_ENTRY_SELECTOR = (
+    'a[href*="/Visure/SceltaServizio.do"][href*="VCVC_"], '
+    'form[name="SelConv"], select[name="listacom"]'
+)
+
+
+async def _wait_for_sister_consultations_outcome(page: Page, timeout_ms: int = 15000) -> str:
+    """Attende privacy, servizio Visure o ingresso diretto nel modulo."""
+    if "/Visure/" in page.url:
+        return "visure"
+
+    outcome = page.locator(
+        f"{_SISTER_SERVICES_PRIVACY_SELECTOR}, {_SISTER_VISURE_SERVICE_SELECTOR}"
+    ).first
+    try:
+        await outcome.wait_for(state="attached", timeout=timeout_ms)
+    except PlaywrightTimeoutError:
+        return "missing"
+
+    if "/Visure/" in page.url:
+        return "visure"
+    if await page.locator(_SISTER_SERVICES_PRIVACY_SELECTOR).count() > 0:
+        return "privacy"
+    if await page.locator(_SISTER_VISURE_SERVICE_SELECTOR).count() > 0:
+        return "service"
+    return "missing"
+
+
+async def _open_sister_consultations(page: Page, logger: PageLogger, *, log_step: str) -> str:
+    """Apre Consultazioni e attende il contenuto utile, con URL come fallback."""
+    consultations = page.get_by_role("link", name="Consultazioni e Certificazioni")
+    await consultations.wait_for(state="attached", timeout=15000)
+    await consultations.click(no_wait_after=True)
+
+    outcome = await _wait_for_sister_consultations_outcome(page)
+    if outcome == "missing":
+        print("[LOGIN] Il menu Consultazioni non e' ancora pronto; uso il relativo URL interno...")
+        try:
+            await page.goto(
+                _SISTER_CONSULTATIONS_URL,
+                timeout=30000,
+                wait_until="domcontentloaded",
+            )
+        except Exception:
+            # SISTER talvolta interrompe la goto per completare una propria
+            # navigazione. Accettiamo il caso solo se compare comunque uno
+            # degli elementi attesi.
+            pass
+        outcome = await _wait_for_sister_consultations_outcome(page)
+
+    await logger.log(page, log_step)
+    return outcome
+
+
 async def _confirm_sister_services_privacy_if_present(page: Page, logger: PageLogger) -> bool:
     """Conferma l'informativa mostrata entrando nelle consultazioni SISTER.
 
@@ -470,7 +533,7 @@ async def _confirm_sister_services_privacy_if_present(page: Page, logger: PageLo
     ``Servizi/index.jsp``. Finche' il relativo form privacy non viene
     confermato, il portale non mostra il collegamento alle Visure catastali.
     """
-    confirm = page.locator('form input[type="submit"][name="submit"][value="Conferma"]')
+    confirm = page.locator(_SISTER_SERVICES_PRIVACY_SELECTOR)
     count = await confirm.count()
     if count == 0:
         return False
@@ -478,10 +541,72 @@ async def _confirm_sister_services_privacy_if_present(page: Page, logger: PageLo
         raise RuntimeError("Pagina servizi SISTER con piu' pulsanti Conferma privacy")
 
     print("[LOGIN] Confermo l'informativa privacy dei servizi SISTER...")
-    await confirm.click()
-    await page.wait_for_load_state("domcontentloaded", timeout=30000)
+    await confirm.click(no_wait_after=True)
+    await confirm.wait_for(state="detached", timeout=30000)
     await logger.log(page, "informativa_servizi_confermata")
     return True
+
+
+async def _wait_for_sister_visure_entry(page: Page) -> None:
+    """Attende il primo controllo utile del modulo Visure."""
+    await page.locator(_SISTER_VISURE_ENTRY_SELECTOR).first.wait_for(
+        state="attached",
+        timeout=30000,
+    )
+
+
+async def _open_sister_visure_from_services(page: Page, logger: PageLogger) -> None:
+    """Apre Visure catastali dal portale SISTER in modo deterministico.
+
+    Il portale puo' mostrare l'informativa privacy oppure caricare l'elenco
+    servizi in ritardo. Attendiamo il contenuto reale della sezione, usiamo il
+    link identificato dal suo href e ricorriamo all'URL interno di Visure solo
+    se il link non compare.
+    """
+    if "/Visure/" in page.url:
+        return
+
+    print("[LOGIN] Clicco 'Consultazioni e Certificazioni'...")
+    outcome = await _open_sister_consultations(page, logger, log_step="consultazioni")
+
+    if outcome == "privacy":
+        await _confirm_sister_services_privacy_if_present(page, logger)
+        print("[LOGIN] Riapro 'Consultazioni e Certificazioni'...")
+        outcome = await _open_sister_consultations(
+            page,
+            logger,
+            log_step="consultazioni_dopo_informativa",
+        )
+
+    if outcome == "visure":
+        await _wait_for_sister_visure_entry(page)
+        return
+
+    if outcome == "service":
+        visure_link = page.locator(_SISTER_VISURE_SERVICE_SELECTOR).first
+        try:
+            print("[LOGIN] Clicco 'Visure catastali' appena disponibile...")
+            await visure_link.click(no_wait_after=True)
+            await _wait_for_sister_visure_entry(page)
+            await logger.log(page, "visure_catastali")
+            return
+        except Exception as exc:
+            print(f"[LOGIN] Apertura dal link non riuscita ({exc}); uso l'URL interno...")
+    else:
+        print("[LOGIN] Link Visure catastali non comparso; uso l'URL interno...")
+
+    try:
+        await page.goto(
+            _SISTER_VISURE_INFORMATIVA_URL,
+            timeout=30000,
+            wait_until="domcontentloaded",
+        )
+    except Exception:
+        if "/Visure/" not in page.url:
+            raise
+
+    await _wait_for_sister_visure_entry(page)
+    await logger.log(page, "visure_catastali_fallback")
 
 
 async def login(page: Page):
@@ -587,36 +712,8 @@ async def login(page: Page):
         # siamo nella pagina iniziale dei servizi SISTER, usiamo i link interni
         # che trasferiscono correttamente la sessione autenticata.
         if "/Visure/" not in page.url:
-            step = "consultazioni"
-            print("[LOGIN] Clicco 'Consultazioni e Certificazioni'...")
-            await page.get_by_role("link", name="Consultazioni e Certificazioni").click()
-            await logger.log(page, "consultazioni")
-
-            step = "informativa_servizi"
-            privacy_confirmed = await _confirm_sister_services_privacy_if_present(page, logger)
-            if "/Visure/" not in page.url:
-                visure_link = page.get_by_role("link", name="Visure catastali")
-                reopen_consultations = privacy_confirmed
-                if not reopen_consultations:
-                    try:
-                        await visure_link.wait_for(state="attached", timeout=3000)
-                    except PlaywrightTimeoutError:
-                        reopen_consultations = True
-
-                if reopen_consultations:
-                    # La conferma dell'informativa e alcuni ritorni dal portale
-                    # lasciano l'utente nella Home dei Servizi. Riaprire la
-                    # sezione rende il flusso stabile anche con privacy gia' letta.
-                    step = "consultazioni_dopo_informativa"
-                    print("[LOGIN] Riapro 'Consultazioni e Certificazioni'...")
-                    await page.get_by_role("link", name="Consultazioni e Certificazioni").click()
-                    await logger.log(page, "consultazioni_dopo_informativa")
-                    visure_link = page.get_by_role("link", name="Visure catastali")
-
-                step = "visure_catastali"
-                print("[LOGIN] Clicco 'Visure catastali'...")
-                await visure_link.click()
-                await logger.log(page, "visure_catastali")
+            step = "apertura_visure"
+            await _open_sister_visure_from_services(page, logger)
 
         step = "contesto_visure"
         selected_convention = await ensure_sister_visure_context(page, logger)

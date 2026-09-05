@@ -34,6 +34,7 @@ e questo progetto aderisce al [Versionamento Semantico](https://semver.org/lang/
 - Rimosse dipendenze `sqlalchemy` e `psycopg[binary]`
 
 ### Corretto
+- Reso deterministico l'ingresso in Visure catastali: il servizio viene atteso tramite il relativo URL e, se il menu SISTER tarda a popolarsi, viene usato un accesso interno controllato.
 - Ridotte le attese delle visure: riuso dell'ufficio attivo e avanzamento appena compare l'elemento necessario, con fallback al percorso completo.
 - Rimosso `sys.exit(0)` duplicato nel gestore dei segnali
 - **Stabilità Docker**: rimosso flag Chromium `--single-process` (incompatibile con Docker, causava crash sporadici al re-init) e aggiunta chiusura esplicita dell'istanza Playwright precedente in `BrowserManager.initialize()` e `BrowserManager.close()` per evitare processi Chromium orfani durante session recovery e shutdown
